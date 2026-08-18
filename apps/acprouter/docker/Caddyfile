@@ -1,0 +1,20 @@
+# The front door for the Docker Compose deployment (spec §8.1). This is the
+# ONLY service in docker-compose.yml that publishes a port to the host — the
+# acprouter and postgres services are reachable only from inside the
+# `internal` compose network. See ../README.md "Deploying it for real".
+#
+# CADDY_BASIC_AUTH_USER / CADDY_BASIC_AUTH_HASH come from the environment
+# (docker-compose.yml passes them through from your .env — see
+# .env.example). Generate a real hash with:
+#   docker run --rm caddy:2-alpine caddy hash-password --plaintext '<your password>'
+{
+	admin off
+}
+
+:80 {
+	basic_auth {
+		{$CADDY_BASIC_AUTH_USER} {$CADDY_BASIC_AUTH_HASH}
+	}
+
+	reverse_proxy acprouter:15420
+}

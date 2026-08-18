@@ -1,0 +1,29 @@
+@import "tailwindcss";
+@import "kui/styles.css";
+
+@source "../../src";
+@source "../../../../packages/kui";
+@source "../../../../packages/openlib";
+
+/*
+ * Agent status dot colors (task #10) — kui ships no semantic "success"/
+ * "warning" token (only `--destructive`), and the project convention against
+ * raw Tailwind color classes applies here same as anywhere: two new tokens
+ * rather than a `bg-green-500`/`bg-amber-500` literal. `error`/`auth_required`
+ * borrow existing tokens where one already fits (`--destructive`) and only
+ * add what's missing (`connected`, `auth_required`'s amber).
+ */
+:root {
+  --status-connected: 142 71% 45%;
+  --status-warning: 38 92% 50%;
+}
+
+.dark {
+  --status-connected: 142 60% 45%;
+  --status-warning: 38 85% 55%;
+}
+
+@theme inline {
+  --color-status-connected: hsl(var(--status-connected));
+  --color-status-warning: hsl(var(--status-warning));
+}

@@ -1,0 +1,26 @@
+{
+  "name": "acprouter-repo",
+  "private": true,
+  "version": "0.0.1",
+  "packageManager": "pnpm@10.15.1",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "pnpm --filter @acprouter/server dev",
+    "build": "pnpm --filter @acprouter/server build",
+    "start": "pnpm --filter @acprouter/server start",
+    "typecheck": "pnpm --filter @acprouter/server typecheck",
+    "lint": "pnpm --filter @acprouter/server lint:err",
+    "test": "pnpm --filter @acprouter/server test",
+    "db:generate": "pnpm --filter @acprouter/server db:generate",
+    "db:migrate": "pnpm --filter @acprouter/server db:migrate",
+    "cli:build": "pnpm --filter @acprouter/cli build",
+    "acp:build": "pnpm --filter @acprouter/acp build"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.2.3",
+    "tsx": "^4.20.5"
+  }
+}

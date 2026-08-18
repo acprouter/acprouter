@@ -1,0 +1,42 @@
+{
+  "name": "@acprouter/acp",
+  "description": "ACP Router consumer shim — an ACP agent on stdio, an ACP client to the Router. What Zed and JetBrains spawn when they have no URL variant in their agent config schema.",
+  "version": "0.0.1",
+  "private": false,
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "bin": {
+    "acprouter-acp": "./bin/acprouter-acp.mjs"
+  },
+  "files": [
+    "bin",
+    "dist"
+  ],
+  "scripts": {
+    "dev": "tsx src/cli.ts",
+    "build": "tsup",
+    "prepack": "pnpm run build",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome format . --write && biome check . --write",
+    "lint:err": "biome format . --write && biome check . --write --diagnostic-level=error",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "^1.3.0",
+    "ws": "^8.18.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.2",
+    "@types/ws": "^8.18.1",
+    "tsup": "^8.5.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.3",
+    "vitest": "^2.1.8"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

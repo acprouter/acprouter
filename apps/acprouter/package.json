@@ -1,0 +1,50 @@
+{
+  "name": "@acprouter/server",
+  "description": "ACP Router — open-source, self-hostable gateway that local ACP agents dial out to.",
+  "version": "0.0.1",
+  "private": false,
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "dev": "next-ws patch && next dev -H 127.0.0.1 -p 15420",
+    "build": "next-ws patch && next build",
+    "start": "next start -H 127.0.0.1 -p 15420",
+    "typecheck": "next typegen && tsc --noEmit",
+    "lint": "biome format . --write && biome check . --write",
+    "lint:err": "biome format . --write && biome check . --write --diagnostic-level=error",
+    "test": "vitest run",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
+    "verify:db-boot": "NODE_OPTIONS='--conditions react-server' tsx scripts/verify-db-boot.ts"
+  },
+  "dependencies": {
+    "@acprouter/contract": "workspace:*",
+    "@acprouter/core": "workspace:*",
+    "@agentclientprotocol/sdk": "^1.3.0",
+    "@orpc/server": "^1.14.6",
+    "kui": "workspace:*",
+    "lucide-react": "^0.544.0",
+    "next": "16.2.6",
+    "next-ws": "^2.2.7",
+    "openlib": "workspace:*",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "wouter": "^3.9.0",
+    "ws": "^8.18.1",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.1.17",
+    "@types/node": "^24.13.2",
+    "@types/react": "19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@types/ws": "^8.18.1",
+    "drizzle-kit": "^0.31.7",
+    "tailwindcss": "^4.1.17",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.3",
+    "vitest": "^2.1.8"
+  }
+}

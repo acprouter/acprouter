@@ -1,0 +1,41 @@
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "target": "ESNext",
+    "lib": ["dom", "dom.iterable", "esnext"],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "forceConsistentCasingInFileNames": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "react-jsx",
+    "incremental": true,
+    "paths": {
+      "~/*": ["./src/*"],
+      "kui/*": ["../../packages/kui/src/components/ui/*"],
+      "kui/utils": ["../../packages/kui/src/lib/utils.ts"],
+      "@acprouter/contract": ["../../packages/acprouter-contract/src/index.ts"],
+      "@acprouter/contract/*": ["../../packages/acprouter-contract/src/*"],
+      "@acprouter/core": ["../../packages/acprouter-core/src/index.ts"],
+      "@acprouter/core/*": ["../../packages/acprouter-core/src/*"]
+    },
+    "plugins": [
+      {
+        "name": "next"
+      }
+    ]
+  },
+  "include": [
+    "next-env.d.ts",
+    "**/*.ts",
+    "**/*.tsx",
+    ".next/types/**/*.ts",
+    ".next/dev/types/**/*.ts"
+  ],
+  "exclude": ["node_modules"]
+}

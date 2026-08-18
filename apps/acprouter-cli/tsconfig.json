@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2023"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "noEmit": true,
+    "isolatedModules": true,
+    "resolveJsonModule": true,
+    "types": ["node"],
+    "paths": {
+      "@acprouter/contract": ["../../packages/acprouter-contract/src/index.ts"],
+      "@acprouter/contract/*": ["../../packages/acprouter-contract/src/*"],
+      "@acprouter/core": ["../../packages/acprouter-core/src/index.ts"],
+      "@acprouter/core/*": ["../../packages/acprouter-core/src/*"]
+    }
+  },
+  "include": ["src/**/*.ts", "tsup.config.ts"]
+}

@@ -1,0 +1,88 @@
+# Reference self-hosted deployment for apps/acprouter (spec §8.1: "Docker
+# and k8s examples should show the proxy, not omit it"). Three services:
+#
+#   proxy (Caddy, basic auth)  ──published──▶  host
+#         │  internal network only
+#         ▼
+#   acprouter  ──internal network only──▶  postgres
+#
+# `acprouter` and `postgres` publish NO `ports:` to the host at all — Compose's
+# network isolation is what actually gates access to them, not any bind
+# address inside either container (see Dockerfile's HOSTNAME comment).
+# `proxy` is the only service with a published port, and it is the only way
+# in from the host. This is the "put your own front door on it" story from
+# the README's first screen, made runnable.
+#
+# Quickstart:
+#   cp apps/acprouter/.env.example apps/acprouter/.env   # then edit it
+#   docker compose -f apps/acprouter/docker-compose.yml --env-file apps/acprouter/.env up --build
+#   curl -u "$CADDY_BASIC_AUTH_USER:<your plaintext password>" http://localhost:18089/
+
+services:
+  acprouter:
+    build:
+      context: ../..
+      dockerfile: apps/acprouter/Dockerfile
+    environment:
+      PG_DATABASE_URL: postgres://acprouter:${POSTGRES_PASSWORD:-acprouter}@postgres:5432/acprouter
+      # The banner from task #16 (spec §8.1 point 3) would otherwise warn
+      # every operator who did this correctly — a real reverse proxy really
+      # is in front of this instance in this topology, so tell the app so.
+      ACPROUTER_TRUST_REVERSE_PROXY: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - internal
+    # No `ports:` — see the header comment above and Dockerfile.
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:15420/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: acprouter
+      POSTGRES_USER: acprouter
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-acprouter}
+    volumes:
+      - acprouter_postgres_data:/var/lib/postgresql/data
+    networks:
+      - internal
+    # No `ports:` either — a self-hosted deployment's database has no
+    # business being reachable from outside the compose network, proxy or
+    # not. This is also why the app example does NOT reuse the dev-only
+    # embedded PGLite here (see README): a real deployment wants a real,
+    # separately backed-up, separately scaled database, not a single
+    # process's local file.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U acprouter"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  proxy:
+    image: caddy:2-alpine
+    volumes:
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+    environment:
+      CADDY_BASIC_AUTH_USER: ${CADDY_BASIC_AUTH_USER:-admin}
+      CADDY_BASIC_AUTH_HASH: ${CADDY_BASIC_AUTH_HASH:?Set CADDY_BASIC_AUTH_HASH in apps/acprouter/.env — see .env.example for how to generate one}
+    ports:
+      - "${ACPROUTER_PROXY_PORT:-18089}:80"
+    depends_on:
+      - acprouter
+    networks:
+      - internal
+    restart: unless-stopped
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  acprouter_postgres_data:
