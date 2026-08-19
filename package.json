@@ -1,7 +1,7 @@
 {
   "name": "acprouter-repo",
   "private": true,
-  "version": "0.0.1",
+  "version": "0.1.0",
   "packageManager": "pnpm@10.15.1",
   "workspaces": [
     "apps/*",

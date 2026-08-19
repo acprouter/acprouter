@@ -1,7 +1,7 @@
 {
   "name": "@acprouter/acp",
   "description": "ACP Router consumer shim — an ACP agent on stdio, an ACP client to the Router. What Zed and JetBrains spawn when they have no URL variant in their agent config schema.",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "private": false,
   "license": "MIT",
   "publishConfig": {

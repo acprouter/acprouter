@@ -1,7 +1,7 @@
 {
   "name": "@acprouter/cli",
   "description": "ACP Router local bridge — dials out to a Router and puts this machine's agents on the network.",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "private": false,
   "license": "MIT",
   "publishConfig": {
@@ -25,13 +25,13 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@acprouter/contract": "workspace:*",
-    "@acprouter/core": "workspace:*",
     "@agentclientprotocol/sdk": "^1.3.0",
     "commander": "^14.0.0",
     "ws": "^8.18.1"
   },
   "devDependencies": {
+    "@acprouter/contract": "workspace:*",
+    "@acprouter/core": "workspace:*",
     "@types/node": "^24.13.2",
     "@types/ws": "^8.18.1",
     "tsup": "^8.5.0",

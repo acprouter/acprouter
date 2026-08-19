@@ -16,7 +16,16 @@ WORKDIR /app
 FROM base AS deps
 # Step 1: only lock & root manifest for maximum cache reuse
 COPY pnpm-lock.yaml pnpm-workspace.yaml package.json .npmrc* ./
-COPY patches patches
+# No `COPY patches patches` here: this app's dependency closure has no
+# `pnpm.patchedDependencies` entries (checked directly — the generated
+# `package.json` has no `pnpm` key at all), so there is nothing for pnpm
+# to apply a patch to. Copying kapps' own root `patches/` dir would ship
+# private monorepo-wide patch files that don't even apply here, on top of
+# unconditionally breaking this build: the published repo's own publish
+# script never copies `patches/`, so `COPY patches patches` failed with
+# "not found" on every build from that repo — confirmed with a real
+# `docker build` against the actual published tree, not assumed.
+#
 # `pnpm fetch` downloads the WHOLE monorepo lockfile (thousands of packages
 # across all 50+ apps), not just this app's subset — retry on transient
 # registry socket timeouts rather than fail the whole build on one flaky
