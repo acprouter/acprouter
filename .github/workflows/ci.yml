@@ -1,0 +1,82 @@
+# `ci-ok` is the only required status check on `main` — requiring the
+# individual jobs instead would mean editing branch protection every time a
+# job is added, renamed, or split.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: 24.18.0
+  # kui/openlib are consumed as source dependencies, not built/tested as
+  # products of this repo — their own typecheck/test scripts are checked
+  # transitively via apps/acprouter + packages/acprouter-core actually
+  # importing from them (same reasoning busabase's own CI applies to
+  # busabase-contract/open-domains). Naming targets explicitly here, instead
+  # of a blanket `pnpm -r`, also means a future unrelated kui/openlib
+  # typecheck issue can't block every PR in THIS repo.
+  CHECK_FILTER: --filter "@acprouter/server" --filter "@acprouter/cli" --filter "@acprouter/acp" --filter "@acprouter/core" --filter "@acprouter/contract"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec biome check .
+
+  typecheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm ${{ env.CHECK_FILTER }} --if-present run typecheck
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # All PGLite-backed (packages/acprouter-core's integration suite spins
+      # up a real, disposable PGLite instance per test file) or pure unit
+      # tests — no external services, no secrets needed.
+      - run: pnpm ${{ env.CHECK_FILTER }} --if-present run test
+
+  ci-ok:
+    name: ci-ok
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [lint, typecheck, test]
+    if: always()
+    steps:
+      - name: Fail unless every check succeeded
+        run: |
+          for result in "${{ needs.lint.result }}" "${{ needs.typecheck.result }}" "${{ needs.test.result }}"; do
+            echo "job result: $result"
+            [ "$result" = "success" ] || exit 1
+          done

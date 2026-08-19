@@ -1,0 +1,99 @@
+# Publishes @acprouter/cli + @acprouter/acp to npm with provenance, from
+# this repo, on GitHub's official ubuntu-latest runner.
+#
+# Scope is deliberately just these two: they're the only packages the README
+# tells a reader to run via `npx`. @acprouter/core and @acprouter/contract
+# are bundled straight into the CLI's build (see apps/acprouter-cli's
+# tsup.config.ts) rather than published as separate runtime dependencies, and
+# @acprouter/server (this repo's own Router app) is self-hosted via git clone
+# or the Dockerfile — nothing in the README installs it from npm.
+#
+# Idempotent: a version already on npm is skipped, so re-running this after a
+# partial failure (or a push that didn't bump versions) is always safe.
+name: Publish npm
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/acprouter-cli/**"
+      - "apps/acprouter-acp/**"
+      - "packages/acprouter-core/**"
+      - "packages/acprouter-contract/**"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - ".github/workflows/publish-npm.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: publish-npm-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # npm provenance
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      NPM_CONFIG_PROVENANCE: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.18.0
+          registry-url: "https://registry.npmjs.org"
+
+      # pnpm publish does not reliably read the token from setup-node's
+      # .npmrc; write the expanded token into a workspace-root .npmrc pnpm
+      # always reads (same fix busabase's own publish-npm.yml uses).
+      - name: Configure npm auth for pnpm
+        run: |
+          echo "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}" >> .npmrc
+          echo "registry=https://registry.npmjs.org/" >> .npmrc
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Get versions
+        id: v
+        run: |
+          echo "cli=$(node -p "require('./apps/acprouter-cli/package.json').version")" >> "$GITHUB_OUTPUT"
+          echo "acp=$(node -p "require('./apps/acprouter-acp/package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Build and test @acprouter/cli
+        working-directory: apps/acprouter-cli
+        run: |
+          pnpm typecheck
+          pnpm test
+          pnpm build
+          test -f dist/cli.js
+          node dist/cli.js --help
+
+      - name: Build and test @acprouter/acp
+        working-directory: apps/acprouter-acp
+        run: |
+          pnpm typecheck
+          pnpm test
+          pnpm build
+          test -f dist/cli.js
+          node dist/cli.js --help
+
+      - name: Check published versions
+        id: pub
+        run: |
+          npm view @acprouter/cli@${{ steps.v.outputs.cli }} version >/dev/null 2>&1 && echo "cli=true" >> "$GITHUB_OUTPUT" || echo "cli=false" >> "$GITHUB_OUTPUT"
+          npm view @acprouter/acp@${{ steps.v.outputs.acp }} version >/dev/null 2>&1 && echo "acp=true" >> "$GITHUB_OUTPUT" || echo "acp=false" >> "$GITHUB_OUTPUT"
+
+      - name: Publish @acprouter/cli
+        if: steps.pub.outputs.cli != 'true'
+        working-directory: apps/acprouter-cli
+        run: pnpm publish --access public --no-git-checks
+
+      - name: Publish @acprouter/acp
+        if: steps.pub.outputs.acp != 'true'
+        working-directory: apps/acprouter-acp
+        run: pnpm publish --access public --no-git-checks
