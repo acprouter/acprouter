@@ -6,7 +6,12 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { WebSocket, WebSocketServer } from "ws";
 import { runWithMemberContext } from "../../../context";
 import { type Database, getDb } from "../../../db";
-import { acprouterAgents, acprouterMachines } from "../../../db/schema";
+import {
+  acprouterAgentSessionEvents,
+  acprouterAgentSessions,
+  acprouterAgents,
+  acprouterMachines,
+} from "../../../db/schema";
 import { streamFromWebSocket } from "./acp-ws-stream";
 import { listAgents } from "./agents-logic";
 import {
@@ -19,6 +24,7 @@ import {
   DEFAULT_PERMISSION_TIMEOUT_MS,
   watchSession,
 } from "./session-relay-registry";
+import { promptAgentSession, startAgentSession } from "./sessions-logic";
 
 const SCRATCH_DIR = ".data/machine-bridge-connection-test";
 
@@ -79,6 +85,11 @@ describe("acceptMachineBridgeConnection", () => {
 
   afterEach(async () => {
     permissionTimeoutMsOverride = DEFAULT_PERMISSION_TIMEOUT_MS;
+    // Child-first: the attachment tests below run a real `session/new`, so
+    // there are real session (and event) rows holding foreign keys into the
+    // agents this then deletes.
+    await db.delete(acprouterAgentSessionEvents);
+    await db.delete(acprouterAgentSessions);
     await db.delete(acprouterAgents);
     await db.delete(acprouterMachines);
   });
@@ -361,6 +372,8 @@ describe("acceptMachineBridgeConnection", () => {
    * handlers call (`sessions-logic.ts`). Nothing about the ACP transport or
    * the relay routing itself is mocked.
    */
+  let sessionSeq = 0;
+
   describe("session relay routing (task #11)", () => {
     it("routes session/update and a permission request only to the session a browser is watching, and a real in-time answer delivers exactly {outcome:{outcome:'selected',optionId}} to the spawned agent", async () => {
       const machineId = await createMachine();
@@ -429,6 +442,288 @@ describe("acceptMachineBridgeConnection", () => {
 
       const resolvedResult = await watcher.next();
       expect(resolvedResult.value).toEqual({ type: "permission_resolved", optionId: "deny" });
+
+      cliSocket.close();
+      agentConnection.close();
+    });
+
+    /**
+     * What a user attaching a PDF actually produces on the wire.
+     *
+     * Everything below this point is real: a real `ws` socket, the real
+     * `session/prompt` request built by `buildPromptContent` and serialized
+     * by the real ACP SDK, received by a real `acp.agent()` implementation.
+     * Unit tests pin what `buildPromptContent` RETURNS; only this pins what
+     * an agent actually RECEIVES — which is where an unserialisable field, a
+     * rejected `attachment:///` URI, or a schema that quietly drops
+     * `filename` would show up instead.
+     */
+    /**
+     * `promptCapabilities` is reported the way a REAL bridge reports it: on
+     * the `session/new` response `_meta`, not the `initialize` one.
+     *
+     * That distinction is the whole point. A bridged machine does not spawn
+     * its agent until `session/new` — the `initialize` handshake happens
+     * before any agent exists, and advertises only what the CLI itself
+     * implements. So the capabilities of the agent a session is actually
+     * talking to can only ride back on that session's own response.
+     *
+     * Pass `null` to stand in for a CLI built before this channel existed:
+     * it reports nothing, and the Router must fall back to sending
+     * everything rather than withholding attachments it has no basis to
+     * withhold.
+     */
+    async function connectRecordingAgent(promptCapabilities: acp.PromptCapabilities | null) {
+      const machineId = await createMachine();
+      const received: acp.ContentBlock[][] = [];
+      const agentApp = acp
+        .agent({ name: "recording-cli" })
+        .onRequest(acp.methods.agent.initialize, () => ({
+          protocolVersion: acp.PROTOCOL_VERSION,
+          // Deliberately NOT the inner agent's capabilities — a real bridge
+          // reports only its own here, which is exactly why the Router cannot
+          // learn them from this handshake.
+          agentCapabilities: { loadSession: false },
+          authMethods: [],
+          // Without `_meta` the bridge creates no agent row at all (task #10),
+          // and there would be nothing for `promptAgentSession` to resolve.
+          _meta: {
+            registrySlug: "claude-acp",
+            cwd: "/home/user/projects/demo",
+            detectedVersion: "1.4.0",
+            authState: "ok",
+            authDetail: null,
+          } satisfies BridgeInitializeMeta,
+        }))
+        .onRequest(acp.methods.agent.session.new, () => ({
+          // Unique across the whole FILE, not just this agent: the
+          // capability registry is keyed by session id and lives for the
+          // process, so a per-call counter would hand two tests the same id
+          // and leak the first one's capabilities into the second.
+          sessionId: `sess_attach_${++sessionSeq}`,
+          ...(promptCapabilities ? { _meta: { promptCapabilities } } : {}),
+        }))
+        .onRequest(acp.methods.agent.session.prompt, (ctx) => {
+          received.push(ctx.params.prompt);
+          return { stopReason: "end_turn" as const };
+        });
+      const { cliSocket, agentConnection } = await connectFakeMachine(machineId, agentApp);
+      await waitFor(async () => (await agentRowFor(machineId)) !== undefined);
+      const agent = await agentRowFor(machineId);
+      if (!agent) throw new Error("no agent row for the connected machine");
+      // The real `session/new` round trip — this is what populates the
+      // per-session capability registry `promptAgentSession` reads.
+      const { sessionId } = await startAgentSession(db, agent.id);
+      return { agentId: agent.id, sessionId, received, cliSocket, agentConnection };
+    }
+
+    async function drain(generator: AsyncGenerator<unknown>) {
+      const out: unknown[] = [];
+      for await (const event of generator) out.push(event);
+      return out;
+    }
+
+    it("delivers an attached PDF to a real agent as an ACP blob resource, filename and all", async () => {
+      const { agentId, sessionId, received, cliSocket, agentConnection } =
+        await connectRecordingAgent({
+          embeddedContext: true,
+        });
+      // A real PDF header, including a NUL byte — the thing that must NOT be
+      // mistaken for text and must survive base64 round-tripping intact.
+      const pdf = Buffer.from([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x37, 0x00, 0xff]);
+
+      await drain(
+        promptAgentSession(db, {
+          agentId,
+          sessionId,
+          text: "summarise this",
+          attachments: [
+            {
+              kind: "file",
+              data: pdf.toString("base64"),
+              mimeType: "application/pdf",
+              filename: "q3 report.pdf",
+            },
+          ],
+        }),
+      );
+
+      expect(received).toHaveLength(1);
+      expect(received[0]).toEqual([
+        { type: "text", text: "summarise this" },
+        {
+          type: "resource",
+          resource: {
+            uri: "attachment:///q3%20report.pdf",
+            mimeType: "application/pdf",
+            blob: pdf.toString("base64"),
+          },
+        },
+      ]);
+      // The bytes the agent could decode are the bytes the user attached.
+      const block = received[0]?.[1] as { resource: { blob: string } };
+      expect(Buffer.from(block.resource.blob, "base64").equals(pdf)).toBe(true);
+
+      cliSocket.close();
+      agentConnection.close();
+    });
+
+    it("delivers an attached Markdown file as readable ACP text, not base64 the agent must decode", async () => {
+      const { agentId, sessionId, received, cliSocket, agentConnection } =
+        await connectRecordingAgent({
+          embeddedContext: true,
+        });
+
+      await drain(
+        promptAgentSession(db, {
+          agentId,
+          sessionId,
+          text: "",
+          attachments: [
+            {
+              kind: "file",
+              data: Buffer.from("# 报告\n\nrevenue up", "utf8").toString("base64"),
+              mimeType: "text/markdown",
+              filename: "notes.md",
+            },
+          ],
+        }),
+      );
+
+      expect(received[0]?.[1]).toEqual({
+        type: "resource",
+        resource: {
+          uri: "attachment:///notes.md",
+          mimeType: "text/markdown",
+          // Multi-byte CJK survives the base64 → UTF-8 decode.
+          text: "# 报告\n\nrevenue up",
+        },
+      });
+
+      cliSocket.close();
+      agentConnection.close();
+    });
+
+    it("falls back to inlined text, and says so, for an agent that advertises no embeddedContext", async () => {
+      const { agentId, sessionId, received, cliSocket, agentConnection } =
+        await connectRecordingAgent({});
+
+      const events = await drain(
+        promptAgentSession(db, {
+          agentId,
+          sessionId,
+          text: "summarise",
+          attachments: [
+            {
+              kind: "file",
+              data: Buffer.from("a,b\n1,2", "utf8").toString("base64"),
+              mimeType: "text/csv",
+              filename: "data.csv",
+            },
+          ],
+        }),
+      );
+
+      // One text block only — no `resource` block reached an agent that never
+      // said it could take one, which is the ACP compliance point.
+      expect(received[0]).toEqual([
+        {
+          type: "text",
+          text: "summarise\n\n--- Attached file: data.csv ---\na,b\n1,2\n--- End of attached file: data.csv ---",
+        },
+      ]);
+      // …and the user is told what happened rather than left guessing.
+      expect(events).toContainEqual({
+        type: "note",
+        text: "This agent does not accept file attachments, so data.csv was included as plain text instead.",
+      });
+
+      cliSocket.close();
+      agentConnection.close();
+    });
+
+    it("drops a binary attachment such an agent cannot take, and explains why", async () => {
+      const { agentId, sessionId, received, cliSocket, agentConnection } =
+        await connectRecordingAgent({});
+
+      const events = await drain(
+        promptAgentSession(db, {
+          agentId,
+          sessionId,
+          text: "read it",
+          attachments: [
+            {
+              kind: "file",
+              data: Buffer.from([0x25, 0x50, 0x44, 0x46, 0x00]).toString("base64"),
+              mimeType: "application/pdf",
+              filename: "report.pdf",
+            },
+          ],
+        }),
+      );
+
+      expect(received[0]).toEqual([{ type: "text", text: "read it" }]);
+      expect(events).toContainEqual({
+        type: "note",
+        text: "This agent does not accept file attachments, and report.pdf is not text, so it was not sent.",
+      });
+
+      cliSocket.close();
+      agentConnection.close();
+    });
+
+    it("withholds an image from an agent that never advertised the image capability", async () => {
+      const { agentId, sessionId, received, cliSocket, agentConnection } =
+        await connectRecordingAgent({
+          embeddedContext: true,
+        });
+
+      const events = await drain(
+        promptAgentSession(db, {
+          agentId,
+          sessionId,
+          text: "look",
+          attachments: [{ kind: "image", data: "aW1n", mimeType: "image/png" }],
+        }),
+      );
+
+      expect(received[0]).toEqual([{ type: "text", text: "look" }]);
+      expect(events).toContainEqual({
+        type: "note",
+        text: "This agent does not accept image attachments, so it was not sent.",
+      });
+
+      cliSocket.close();
+      agentConnection.close();
+    });
+
+    it("sends everything to a CLI too old to report capabilities, rather than withholding on a guess", async () => {
+      // `null` = the bridge's `session/new` carries no `_meta` at all, which
+      // is every acprouter-cli built before that channel existed. Withholding
+      // attachments here would BREAK those users; the honest reading of "no
+      // answer" is "not negotiated", not "supports nothing".
+      const { agentId, sessionId, received, cliSocket, agentConnection } =
+        await connectRecordingAgent(null);
+
+      const events = await drain(
+        promptAgentSession(db, {
+          agentId,
+          sessionId,
+          text: "look",
+          attachments: [
+            { kind: "image", data: "aW1n", mimeType: "image/png" },
+            {
+              kind: "file",
+              data: Buffer.from("hi", "utf8").toString("base64"),
+              mimeType: "text/plain",
+              filename: "n.txt",
+            },
+          ],
+        }),
+      );
+
+      expect(received[0]?.map((block) => block.type)).toEqual(["text", "image", "resource"]);
+      expect(events.filter((e) => (e as { type: string }).type === "note")).toEqual([]);
 
       cliSocket.close();
       agentConnection.close();

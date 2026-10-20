@@ -1,7 +1,7 @@
 {
   "name": "acprouter-repo",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "packageManager": "pnpm@10.15.1",
   "workspaces": [
     "apps/*",
@@ -22,5 +22,13 @@
   "devDependencies": {
     "@biomejs/biome": "2.2.3",
     "tsx": "^4.20.5"
+  },
+  "pnpm": {
+    "overrides": {
+      "next-ws": "2.2.12"
+    },
+    "patchedDependencies": {
+      "next-ws@2.2.12": "patches/next-ws@2.2.12.patch"
+    }
   }
 }

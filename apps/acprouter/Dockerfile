@@ -16,16 +16,10 @@ WORKDIR /app
 FROM base AS deps
 # Step 1: only lock & root manifest for maximum cache reuse
 COPY pnpm-lock.yaml pnpm-workspace.yaml package.json .npmrc* ./
-# No `COPY patches patches` here: this app's dependency closure has no
-# `pnpm.patchedDependencies` entries (checked directly — the generated
-# `package.json` has no `pnpm` key at all), so there is nothing for pnpm
-# to apply a patch to. Copying kapps' own root `patches/` dir would ship
-# private monorepo-wide patch files that don't even apply here, on top of
-# unconditionally breaking this build: the published repo's own publish
-# script never copies `patches/`, so `COPY patches patches` failed with
-# "not found" on every build from that repo — confirmed with a real
-# `docker build` against the actual published tree, not assumed.
-#
+# The public repo's export script includes only this workspace's dependency
+# patches. Copy them before fetch/install so next-ws waits for lazy route loading.
+COPY patches patches
+
 # `pnpm fetch` downloads the WHOLE monorepo lockfile (thousands of packages
 # across all 50+ apps), not just this app's subset — retry on transient
 # registry socket timeouts rather than fail the whole build on one flaky
@@ -45,11 +39,14 @@ COPY apps/acprouter/package.json apps/acprouter/
 COPY packages/acprouter-core/package.json packages/acprouter-core/
 COPY packages/acprouter-contract/package.json packages/acprouter-contract/
 COPY packages/kui/package.json packages/kui/
+COPY packages/@acp-ui/core/package.json packages/@acp-ui/core/
+COPY packages/@acp-ui/web/package.json packages/@acp-ui/web/
 COPY packages/openlib/package.json packages/openlib/
 RUN pnpm install --offline --frozen-lockfile --ignore-scripts
 
 # Step 3: bring in source code (only needed workspaces)
 COPY packages/kui packages/kui
+COPY packages/@acp-ui packages/@acp-ui
 COPY packages/openlib packages/openlib
 COPY packages/acprouter-core packages/acprouter-core
 COPY packages/acprouter-contract packages/acprouter-contract
@@ -64,19 +61,23 @@ ENV BUILD_NUMBER=${BUILD_NUMBER}
 ENV BUILD_SHA=${BUILD_SHA}
 ENV BUILD_TIME=${BUILD_TIME}
 WORKDIR /app/apps/acprouter
-RUN NODE_OPTIONS=--max-old-space-size=4096 pnpm build
+# --max-heap-size, not --max-old-space-size: Next deletes the latter from its build
+# workers' env (build/index.js createStaticWorker isolatedMemory: true -> lib/worker.js),
+# so that flag only ever reached the parent process.
+RUN NODE_OPTIONS=--max-heap-size=4096 pnpm build
 
 # ---- drizzle minimal stage (for migrations only) ----
 FROM base AS drizzle
 WORKDIR /drizzle-only
 COPY packages/acprouter-core/package.json /tmp/core-package.json
+COPY package.json /tmp/root-package.json
 RUN set -e; \
-    node -e "require('node:fs').writeFileSync('package.json', JSON.stringify({ private: true }))"; \
+    node -e "const pm=require('/tmp/root-package.json').packageManager; require('node:fs').writeFileSync('package.json', JSON.stringify(pm ? { private: true, packageManager: pm } : { private: true }))"; \
     CORE_JSON=/tmp/core-package.json; \
     DRIZZLE_VERSION=$(node -pe "const p=require('$CORE_JSON'); (p.devDependencies?.['drizzle-kit'] || p.dependencies?.['drizzle-kit'] || '').replace(/^[^0-9]*/, '')"); \
     DRIZZLE_ORM_VERSION=$(node -pe "const p=require('$CORE_JSON'); (p.devDependencies?.['drizzle-orm'] || p.dependencies?.['drizzle-orm'] || '').replace(/^[^0-9]*/, '')"); \
     POSTGRES_VERSION=$(node -pe "const p=require('$CORE_JSON'); (p.devDependencies?.postgres || p.dependencies?.postgres || '').replace(/^[^0-9]*/, '')"); \
-    pnpm add drizzle-kit@${DRIZZLE_VERSION} drizzle-orm@${DRIZZLE_ORM_VERSION} postgres@${POSTGRES_VERSION} --prod --allow-build=esbuild
+    pnpm add drizzle-kit@${DRIZZLE_VERSION} drizzle-orm@${DRIZZLE_ORM_VERSION} postgres@${POSTGRES_VERSION} --save-prod --allow-build=esbuild
 
 # ---- runtime ----
 FROM node:24.18.0-bookworm-slim AS runner

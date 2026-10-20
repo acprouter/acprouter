@@ -1,10 +1,34 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir, platform } from "node:os";
 import { join } from "node:path";
 
 export const PID_FILENAME = "bridge.pid";
 export const LOG_FILENAME = "bridge.log";
 export const CONFIG_FILENAME = "config.json";
+export const HEARTBEAT_FILENAME = "bridge.heartbeat.json";
+
+/**
+ * How often the running bridge process touches its heartbeat file
+ * (`runner.ts`). `resolveBridgeStatus` (`daemon/local-daemon.ts`) treats a
+ * heartbeat older than `HEARTBEAT_STALE_MS` as "unresponsive" even though
+ * the PID itself still answers signal-0 — the actual distinction that
+ * status needs (a hung event loop, a deadlocked reconnect, anything short of
+ * the process dying outright) is invisible to a liveness probe on the PID
+ * alone.
+ */
+export const HEARTBEAT_INTERVAL_MS = 10_000;
+/** 3x the write interval — generous enough that one slow tick never flaps the status. */
+export const HEARTBEAT_STALE_MS = HEARTBEAT_INTERVAL_MS * 3;
+
+/**
+ * `bridge.log` used to grow without bound for as long as a bridge stayed
+ * connected (`runner.ts` appends a line per reconnect/log event, and a
+ * long-lived daemon reconnecting under a flaky network can log for months).
+ * Same numeric thresholds `apps/buda-connector/src/logger.ts` uses — no
+ * reason to pick different ones.
+ */
+export const LOG_MAX_BYTES = 2 * 1024 * 1024;
+export const LOG_BACKUP_COUNT = 2;
 
 /**
  * Result of the connect-time auth probe (task #9, spec §5.2a point 2 /
@@ -60,6 +84,17 @@ export interface DeviceConfig {
    * before this task shipped.
    */
   authStatus?: AuthStatus | null;
+  /**
+   * Raw one-time bridge credential (task #6.4), sent back as an
+   * `Authorization: Bearer` header when dialing the bridge WS — never
+   * appended to the connection URL (query strings end up in proxy/server
+   * access logs). Only present for `oauth-enrollment` machines; absent for
+   * `legacy` ones and for any config written before this task shipped.
+   * `writeDeviceConfig` tightens the file to owner-only permissions whenever
+   * this field is set (task #6.3) — this is a live bearer credential, not a
+   * burned one-time token.
+   */
+  bridgeCredential?: string;
 }
 
 export function resolveAcprouterHome(home?: string): string {
@@ -82,6 +117,43 @@ export function configFilePath(home: string): string {
   return join(home, CONFIG_FILENAME);
 }
 
+export function heartbeatFilePath(home: string): string {
+  return join(home, HEARTBEAT_FILENAME);
+}
+
+export interface HeartbeatInfo {
+  pid: number;
+  updatedAt: string;
+  /** Whether the ACP WebSocket to the Router is attached right now — diagnostic only; staleness of `updatedAt`, not this flag, decides `running` vs `unresponsive`. */
+  connected: boolean;
+}
+
+/** Best-effort — a heartbeat write failing is never worth crashing the bridge over. */
+export function writeHeartbeat(home: string, connected: boolean): void {
+  try {
+    const info: HeartbeatInfo = {
+      pid: process.pid,
+      updatedAt: new Date().toISOString(),
+      connected,
+    };
+    writeFileSync(heartbeatFilePath(home), JSON.stringify(info, null, 2));
+  } catch {
+    // Nothing sane to do — see runner.ts's own log-write failure handling for the same posture.
+  }
+}
+
+export function readHeartbeat(home: string): HeartbeatInfo | null {
+  const path = heartbeatFilePath(home);
+  if (!existsSync(path)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8"));
+    if (typeof parsed?.pid !== "number" || typeof parsed?.updatedAt !== "string") return null;
+    return { pid: parsed.pid, updatedAt: parsed.updatedAt, connected: Boolean(parsed.connected) };
+  } catch {
+    return null;
+  }
+}
+
 export function readDeviceConfig(home: string): DeviceConfig | null {
   const path = configFilePath(home);
   if (!existsSync(path)) return null;
@@ -94,5 +166,14 @@ export function readDeviceConfig(home: string): DeviceConfig | null {
 
 export function writeDeviceConfig(home: string, config: DeviceConfig): void {
   ensureAcprouterHome(home);
-  writeFileSync(configFilePath(home), `${JSON.stringify(config, null, 2)}\n`);
+  const path = configFilePath(home);
+  writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`);
+  // Task #6.3: a persisted bridge credential is a live bearer secret (unlike
+  // the one-time enrollment token, which is already burned by the time this
+  // is written) — the file must not be group- or world-readable. `chmod` is
+  // a POSIX-only no-op on Windows (no equivalent bit to set here), which
+  // matches this repo's existing platform posture elsewhere in this file.
+  if (config.bridgeCredential && platform() !== "win32") {
+    chmodSync(path, 0o600);
+  }
 }

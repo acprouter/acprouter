@@ -49,7 +49,18 @@ rl.on("line", async (line) => {
     send({
       jsonrpc: "2.0",
       id: message.id,
-      result: { protocolVersion: 1, agentCapabilities: { loadSession: true }, authMethods: [] },
+      result: {
+        protocolVersion: 1,
+        // `promptCapabilities` is deliberately partial — `audio` omitted —
+        // so the bridge test can prove the SPAWNED agent's real answer is
+        // what reaches the Router, rather than something invented or
+        // defaulted along the way.
+        agentCapabilities: {
+          loadSession: true,
+          promptCapabilities: { image: true, embeddedContext: true },
+        },
+        authMethods: [],
+      },
     });
     return;
   }

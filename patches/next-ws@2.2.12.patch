@@ -1,0 +1,12 @@
+diff --git a/dist/server/index.cjs b/dist/server/index.cjs
+index 7565a7007907ad8e2301b14b3497ab4f8cd89e39..2496be6e15d8c8f06f153224916aefc88cd8ff4a 100644
+--- a/dist/server/index.cjs
++++ b/dist/server/index.cjs
+@@ -259,6 +259,7 @@ function setupWebSocketServer(nextServer, options) {
+       logger2.error(`[next-ws] could not import module for page ${pathname}`);
+       return socket.end();
+     }
++    await module2.ensureUserland?.();
+     const handleUpgrade = module2.userland.UPGRADE;
+     const handleSocket = module2.userland.SOCKET;
+     if ((!handleUpgrade || typeof handleUpgrade !== "function") && (!handleSocket || typeof handleSocket !== "function")) {

@@ -14,9 +14,10 @@ import {
   acprouterMachines,
 } from "../../../db/schema";
 import { streamFromWebSocket } from "./acp-ws-stream";
-import { listAgents } from "./agents-logic";
+import { listAgents, removeAgent } from "./agents-logic";
 import { acceptMachineBridgeConnection } from "./machine-bridge-connection";
 import { listMachines, mintEnrollmentToken, redeemEnrollmentToken } from "./machines-logic";
+import { getSessionCapabilities } from "./session-capabilities-registry";
 import { listSessionEvents } from "./session-events-logic";
 import { insertActiveSession } from "./session-status-logic";
 import {
@@ -91,7 +92,10 @@ describe("sessions-logic persistence (task #12)", () => {
   }
 
   /** A fake CLI-side agent that actually answers `session/new` and `session/prompt` for real, streaming one real `session/update` before resolving — standing in for `bridge-agent.ts` (task #8) the same way `machine-bridge-connection.integration.test.ts`'s fakes do. */
-  function buildFakeCli(meta: BridgeInitializeMeta): acp.AgentApp {
+  function buildFakeCli(
+    meta: BridgeInitializeMeta,
+    opts?: { onSessionNew?: () => Promise<void> },
+  ): acp.AgentApp {
     let nextSessionId = 0;
     return acp
       .agent({ name: "fake-cli" })
@@ -101,7 +105,8 @@ describe("sessions-logic persistence (task #12)", () => {
         authMethods: [],
         _meta: meta,
       }))
-      .onRequest(acp.methods.agent.session.new, () => {
+      .onRequest(acp.methods.agent.session.new, async () => {
+        await opts?.onSessionNew?.();
         nextSessionId += 1;
         return { sessionId: `sess_fake_${nextSessionId}` };
       })
@@ -190,6 +195,141 @@ describe("sessions-logic persistence (task #12)", () => {
       .from(acprouterAgentSessionEvents)
       .where(eq(acprouterAgentSessionEvents.sessionId, sessionId));
     expect(rows.map((r) => r.seq).sort((a, b) => a - b)).toEqual([1, 2]);
+
+    cliSocket.close();
+    agentConnection.close();
+  });
+
+  it("removeAgent committing in the window between session/new's response and startAgentSession's own locked insert still ends up with no live session row and no leaked capabilities entry", async () => {
+    const machineId = await createMachine();
+    let agentId: string | undefined;
+    const { cliSocket, agentConnection } = await connectFakeMachine(
+      machineId,
+      buildFakeCli(
+        {
+          registrySlug: "claude-acp",
+          cwd: "/home/user/projects/race",
+          detectedVersion: "1.4.0",
+          authState: "ok",
+          authDetail: null,
+        },
+        {
+          // Simulates `removeAgent` running for real in the window between
+          // `session/new`'s response landing (capabilities already
+          // remembered, `onSessionCreated` already fired) and
+          // `startAgentSession`'s own `FOR UPDATE`-locked re-check +
+          // insert transaction. Going through the real `removeAgent` here
+          // (not a raw `UPDATE`) is what the earlier version of this test
+          // skipped — it only pinned the pre-insert window with a direct
+          // column write, which never exercised `removeAgent`'s own
+          // session-ending sweep or proved anything about the registries
+          // `startAgentSession` populates before this hook even runs.
+          // `status` must be `disconnected` first — `removeAgent` only
+          // soft-deletes a row in that state.
+          onSessionNew: async () => {
+            if (!agentId) throw new Error("agentId not resolved before session/new");
+            await db
+              .update(acprouterAgents)
+              .set({ status: "disconnected" })
+              .where(eq(acprouterAgents.id, agentId));
+            const result = await removeAgent(db, agentId);
+            expect(result.ok).toBe(true);
+          },
+        },
+      ),
+    );
+
+    await waitFor(
+      async () => (await listMachines(db)).find((m) => m.id === machineId)?.status === "online",
+    );
+    await waitFor(async () => {
+      agentId = (await listAgents(db)).find((a) => a.machineId === machineId)?.id;
+      return agentId !== undefined;
+    });
+    if (!agentId) throw new Error("agent row never appeared");
+
+    await expect(startAgentSession(db, agentId)).rejects.toThrow(/No agent registered with id/);
+
+    const sessionRows = await db
+      .select()
+      .from(acprouterAgentSessions)
+      .where(eq(acprouterAgentSessions.agentId, agentId));
+    expect(sessionRows).toHaveLength(0);
+
+    // The capabilities `rememberSessionCapabilities` stored right after
+    // `session/new` returned (before this race was even detectable) must
+    // not linger forever just because the session itself never got a
+    // persisted row — `startAgentSession`'s own NOT_FOUND path forgets it.
+    expect(getSessionCapabilities("sess_fake_1")).toBeNull();
+
+    cliSocket.close();
+    agentConnection.close();
+  });
+
+  it("startAgentSession winning the race against a concurrent removeAgent still leaves removeAgent's own sweep able to end the session it could not have seen yet", async () => {
+    const machineId = await createMachine();
+    let agentId: string | undefined;
+    let sawSessionRowDuringRemoval: boolean | undefined;
+    const { cliSocket, agentConnection } = await connectFakeMachine(
+      machineId,
+      buildFakeCli(
+        {
+          registrySlug: "claude-acp",
+          cwd: "/home/user/projects/race-win",
+          detectedVersion: "1.4.0",
+          authState: "ok",
+          authDetail: null,
+        },
+        {
+          // The opposite ordering from the test above: `removeAgent` is
+          // invoked from inside `session/new`'s handler too, but by the
+          // time it runs here `startAgentSession`'s locked transaction
+          // hasn't opened yet either — PGLite's single connection means
+          // these never truly interleave (see the comment on
+          // `agents-logic.integration.test.ts`'s own back-to-back race
+          // test), so this proves the OTHER half of the same contract: even
+          // when `startAgentSession` is the one that ends up committing its
+          // insert first, `removeAgent`'s unconditional "end every live,
+          // non-terminal session row for this agent" sweep still reaches a
+          // row that did not exist when THIS line ran, because the two
+          // transactions serialize on the agent row's `FOR UPDATE` lock —
+          // `removeAgent` cannot have committed before `startAgentSession`'s
+          // own transaction opens if `startAgentSession` is the one that
+          // observably won.
+          onSessionNew: async () => {
+            if (!agentId) throw new Error("agentId not resolved before session/new");
+            const rows = await db
+              .select()
+              .from(acprouterAgentSessions)
+              .where(eq(acprouterAgentSessions.agentId, agentId));
+            sawSessionRowDuringRemoval = rows.length > 0;
+          },
+        },
+      ),
+    );
+
+    await waitFor(
+      async () => (await listMachines(db)).find((m) => m.id === machineId)?.status === "online",
+    );
+    await waitFor(async () => {
+      agentId = (await listAgents(db)).find((a) => a.machineId === machineId)?.id;
+      return agentId !== undefined;
+    });
+    if (!agentId) throw new Error("agent row never appeared");
+
+    const { sessionId } = await startAgentSession(db, agentId);
+    expect(sawSessionRowDuringRemoval).toBe(false);
+    expect(await statusOf(sessionId)).toBe("active");
+
+    // Now run the removal for real, strictly AFTER the insert committed —
+    // its sweep must still find and end this exact row.
+    await db
+      .update(acprouterAgents)
+      .set({ status: "disconnected" })
+      .where(eq(acprouterAgents.id, agentId));
+    const result = await removeAgent(db, agentId);
+    expect(result.ok).toBe(true);
+    expect(await statusOf(sessionId)).toBe("ended");
 
     cliSocket.close();
     agentConnection.close();

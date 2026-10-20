@@ -1,6 +1,15 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
-import { ensureAcprouterHome, logFilePath, pidFilePath, resolveAcprouterHome } from "../config";
+import { existsSync, readFileSync, renameSync, statSync, unlinkSync } from "node:fs";
+import {
+  ensureAcprouterHome,
+  HEARTBEAT_STALE_MS,
+  LOG_BACKUP_COUNT,
+  LOG_MAX_BYTES,
+  logFilePath,
+  pidFilePath,
+  readHeartbeat,
+  resolveAcprouterHome,
+} from "../config";
 
 /**
  * The hidden subcommand the bridge re-invokes itself with when spawned.
@@ -42,6 +51,8 @@ export interface LocalDaemonState {
   pidInfo: PidInfo | null;
   running: boolean;
   stalePidFile: boolean;
+  /** `false` when the PID is alive but its heartbeat is missing or older than `HEARTBEAT_STALE_MS` — a hung event loop, not a dead process. */
+  heartbeatFresh: boolean;
 }
 
 export interface DetachedStartResult {
@@ -96,11 +107,59 @@ function removeStalePidFile(pidPath: string): void {
   }
 }
 
+/**
+ * Renames `bridge.log` → `.1` → `.2` (oldest dropped) once it crosses
+ * `maxBytes`, so a long-lived bridge never grows an unbounded log file.
+ * Synchronous, matching `runner.ts`'s existing `appendFileSync` — the log
+ * write itself is already sync, and rotation only ever runs immediately
+ * before it, so there is no new blocking behavior introduced here, just a
+ * cheap `statSync` on the common (no rotation needed) path.
+ */
+export function rotateLogIfNeeded(
+  logPath: string,
+  maxBytes: number = LOG_MAX_BYTES,
+  backupCount: number = LOG_BACKUP_COUNT,
+): boolean {
+  let size: number;
+  try {
+    size = statSync(logPath).size;
+  } catch {
+    return false; // No log file yet — nothing to rotate.
+  }
+  if (size < maxBytes) return false;
+
+  try {
+    unlinkSync(`${logPath}.${backupCount}`);
+  } catch {
+    // Already gone, or never existed — fine either way.
+  }
+  for (let index = backupCount - 1; index >= 1; index -= 1) {
+    try {
+      renameSync(`${logPath}.${index}`, `${logPath}.${index + 1}`);
+    } catch {
+      // That backup slot didn't exist yet — fine, nothing to shift.
+    }
+  }
+  try {
+    renameSync(logPath, `${logPath}.1`);
+  } catch {
+    return false; // Lost a race with something else touching the file — next check will retry.
+  }
+  return true;
+}
+
 export function tailLog(home?: string, lines = 30): string | null {
   const logPath = logFilePath(resolveAcprouterHome(home));
   if (!existsSync(logPath)) return null;
   const content = readFileSync(logPath, "utf8").split("\n");
   return content.slice(-lines).join("\n");
+}
+
+function isHeartbeatFresh(home: string): boolean {
+  const heartbeat = readHeartbeat(home);
+  if (!heartbeat) return false;
+  const age = Date.now() - new Date(heartbeat.updatedAt).getTime();
+  return Number.isFinite(age) && age <= HEARTBEAT_STALE_MS;
 }
 
 export function resolveLocalDaemonState(home?: string): LocalDaemonState {
@@ -117,6 +176,9 @@ export function resolveLocalDaemonState(home?: string): LocalDaemonState {
     pidInfo,
     running,
     stalePidFile: Boolean(pidInfo) && !running,
+    // Only meaningful while `running` — no point reading a heartbeat file
+    // for a PID that's already confirmed dead.
+    heartbeatFresh: running ? isHeartbeatFresh(resolvedHome) : false,
   };
 }
 
@@ -126,20 +188,95 @@ export function resolveLocalDaemonState(home?: string): LocalDaemonState {
  * and `unresponsive` (alive by signal-0 but not answering) must never both
  * collapse into "not running" — that is the whole point of this type.
  *
- * `unresponsive` is not reachable yet: distinguishing it from `running`
- * needs a liveness probe over the actual bridge↔Router connection, which
- * doesn't exist until task #7. The state stays in the type now so the
- * design doesn't have to be re-derived later, and `status`'s output wiring
- * (`commands/status.ts`) already has a label ready for it.
+ * `unresponsive` is decided by heartbeat freshness (`runner.ts` writes one
+ * every `HEARTBEAT_INTERVAL_MS`; `isHeartbeatFresh` above reads it), not by
+ * probing the actual bridge↔Router connection — a reconnect backoff in
+ * progress is normal and must NOT read as unresponsive, but a heartbeat that
+ * has stopped ticking altogether means the process's own event loop is
+ * hung, which a signal-0 probe can never see (the OS still schedules a
+ * stuck process; it just isn't doing anything).
  */
 export function resolveBridgeStatus(state: LocalDaemonState): BridgeStatus {
-  if (state.running) return "running";
+  if (state.running) return state.heartbeatFresh ? "running" : "unresponsive";
   if (state.stalePidFile) return "stale_pid";
   return "stopped";
 }
 
 export interface StartOptions {
   home?: string;
+}
+
+function getErrorCode(error: unknown): string {
+  return typeof error === "object" && error !== null && "code" in error
+    ? String((error as { code: unknown }).code)
+    : "UNKNOWN";
+}
+
+/** Resolves once the child either genuinely spawns or the OS-level `spawn()` call itself fails (e.g. `EINVAL`) — distinct from the child later exiting on its own. */
+function waitForSpawnOrError(child: ChildProcess): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const onError = (error: Error) => {
+      child.off("spawn", onSpawn);
+      reject(error);
+    };
+    const onSpawn = () => {
+      child.off("error", onError);
+      resolve();
+    };
+    child.once("error", onError);
+    child.once("spawn", onSpawn);
+  });
+}
+
+export interface SpawnDetachedDependencies {
+  platform?: NodeJS.Platform;
+  /** Injectable so the Windows `EINVAL` retry path is unit-testable without an actual Windows machine. */
+  spawnFn?: typeof spawn;
+}
+
+/**
+ * `windowsHide: true` (the default we want, so a detached bridge never
+ * flashes a console window) has a known Node/Windows combination that fails
+ * the underlying spawn syscall with `EINVAL` — retrying once with
+ * `windowsHide: false` on that specific failure is the same fallback
+ * `apps/buda-connector/src/daemon-client.ts`'s `spawnDetachedDaemonProcess`
+ * uses for the identical problem. A no-op on POSIX: `windowsHide` has no
+ * meaning there, so the single attempt always applies and either succeeds or
+ * fails for an unrelated reason (nothing left to retry into).
+ */
+export async function spawnDetachedOrThrow(
+  args: string[],
+  env: NodeJS.ProcessEnv,
+  dependencies: SpawnDetachedDependencies = {},
+): Promise<ChildProcess> {
+  const platform = dependencies.platform ?? process.platform;
+  const spawnFn = dependencies.spawnFn ?? spawn;
+  const strategies = platform === "win32" ? [true, false] : [true];
+  let lastError: unknown;
+  for (const [index, windowsHide] of strategies.entries()) {
+    const child = spawnFn(process.execPath, args, {
+      detached: true,
+      stdio: ["ignore", "ignore", "ignore"],
+      windowsHide,
+      env,
+    });
+    try {
+      await waitForSpawnOrError(child);
+      return child;
+    } catch (error) {
+      lastError = error;
+      const shouldRetry =
+        index < strategies.length - 1 && platform === "win32" && getErrorCode(error) === "EINVAL";
+      if (!shouldRetry) {
+        throw new Error(`Bridge process creation failed: ${getErrorCode(error)}`, {
+          cause: error,
+        });
+      }
+      // Fall through to the next strategy (windowsHide: false).
+    }
+  }
+  // Unreachable given `strategies` is always non-empty, but keeps the return type honest.
+  throw new Error("Bridge process creation failed without a spawn attempt", { cause: lastError });
 }
 
 /**
@@ -156,14 +293,9 @@ export async function startDetached(options: StartOptions = {}): Promise<Detache
   ensureAcprouterHome(home);
   const logPath = logFilePath(home);
 
-  const child = spawn(
-    process.execPath,
+  const child = await spawnDetachedOrThrow(
     [...process.execArgv, process.argv[1] ?? "", RUN_BRIDGE_COMMAND],
-    {
-      detached: true,
-      stdio: ["ignore", "ignore", "ignore"],
-      env: { ...process.env, ACPROUTER_HOME: home },
-    },
+    { ...process.env, ACPROUTER_HOME: home },
   );
   child.unref();
 

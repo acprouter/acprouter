@@ -43,13 +43,19 @@
 
 import type { AgentSessionStreamEventVO } from "@acprouter/contract";
 import * as acp from "@agentclientprotocol/sdk";
+import { eq } from "drizzle-orm";
+import { runWithMemberContext } from "../../../context";
 import type { Database } from "../../../db";
-import { validateConsumerApiKey } from "./consumer-api-keys-logic";
+import { acprouterAgents } from "../schema/agents";
+import { resolveConsumerApiKeyId } from "./consumer-api-keys-logic";
 import { resolveSessionPermission } from "./session-relay-registry";
+import { getSessionAgentId } from "./session-status-logic";
 import { endAgentSession, promptAgentSession, startAgentSession } from "./sessions-logic";
 
 export interface ConsumerAcpIdentity {
   agentId: string;
+  keyId: string;
+  ownerId: string;
 }
 
 /**
@@ -77,10 +83,17 @@ export async function resolveConsumerAcpAuth(
   if (!agentId) return null;
 
   const db = await dbPromise;
-  const valid = await validateConsumerApiKey(db, agentId, bearerToken);
-  if (!valid) return null;
+  const keyId = await resolveConsumerApiKeyId(db, agentId, bearerToken);
+  if (!keyId) return null;
 
-  return { agentId };
+  // The verified key authorizes this exact agent. Resolve its stored tenant,
+  // never a query-string owner or the dashboard's ambient session actor.
+  const [agent] = await db
+    .select({ ownerId: acprouterAgents.ownerId })
+    .from(acprouterAgents)
+    .where(eq(acprouterAgents.id, agentId))
+    .limit(1);
+  return agent ? { agentId, keyId, ownerId: agent.ownerId } : null;
 }
 
 /** Real ACP `ContentBlock[]` → the plain text `promptAgentSession` takes — same reduction Buda's `contentBlocksToPromptText` performs, for the same reason: `sessions-logic.ts`'s `session/prompt` call takes a single `text` field (task #11's prompt-box shape), not a content-block array, and image/audio/resource blocks are not advertised in `promptCapabilities` below, so a well-behaved client won't send them. */
@@ -162,6 +175,24 @@ export function createConsumerAcpAgentApp(
     return identity;
   }
 
+  async function withIdentity<T>(
+    fn: (db: Database, identity: ConsumerAcpIdentity) => Promise<T>,
+  ): Promise<T> {
+    const identity = await requireIdentity();
+    const db = await dbPromise;
+    return runWithMemberContext({ db, ownerId: identity.ownerId }, () => fn(db, identity));
+  }
+
+  async function requireSession(
+    db: Database,
+    identity: ConsumerAcpIdentity,
+    sessionId: string,
+  ): Promise<void> {
+    if ((await getSessionAgentId(db, sessionId)) !== identity.agentId) {
+      throw new Error("Session does not belong to this agent.");
+    }
+  }
+
   return acp
     .agent({ name: "acprouter" })
     .onRequest(acp.methods.agent.initialize, async () => {
@@ -179,53 +210,64 @@ export function createConsumerAcpAgentApp(
         },
       };
     })
-    .onRequest(acp.methods.agent.session.new, async () => {
-      const identity = await requireIdentity();
-      const db = await dbPromise;
-      const { sessionId } = await startAgentSession(db, identity.agentId);
-      return { sessionId };
-    })
-    .onRequest(acp.methods.agent.session.prompt, async (ctx) => {
-      const identity = await requireIdentity();
-      const db = await dbPromise;
-      const text = contentBlocksToPromptText(ctx.params.prompt);
+    .onRequest(acp.methods.agent.session.new, () =>
+      withIdentity(async (db, identity) => {
+        const { sessionId } = await startAgentSession(db, identity.agentId);
+        return { sessionId };
+      }),
+    )
+    .onRequest(acp.methods.agent.session.prompt, (ctx) =>
+      withIdentity(async (db, identity) => {
+        await requireSession(db, identity, ctx.params.sessionId);
+        const text = contentBlocksToPromptText(ctx.params.prompt);
 
-      let stopReason: acp.StopReason = "end_turn";
-      for await (const event of promptAgentSession(db, {
-        agentId: identity.agentId,
-        sessionId: ctx.params.sessionId,
-        text,
-      })) {
-        switch (event.type) {
-          case "session_update":
-            await ctx.client.notify(acp.methods.client.session.update, {
-              sessionId: ctx.params.sessionId,
-              update: event.update,
-            });
-            break;
-          case "permission_request":
-            relayPermissionRequestToConsumer(dbPromise, ctx.client, ctx.params.sessionId, event);
-            break;
-          case "permission_resolved":
-            // No ACP-native notification for this — it is purely dashboard
-            // display; the consumer already knows its own answer.
-            break;
-          case "turn_ended":
-            stopReason = event.stopReason;
-            break;
-          case "session_ended":
-            throw new Error(event.reason);
-          default: {
-            const exhaustive: never = event;
-            throw new Error(`unhandled session event: ${JSON.stringify(exhaustive)}`);
+        let stopReason: acp.StopReason = "end_turn";
+        for await (const event of promptAgentSession(db, {
+          agentId: identity.agentId,
+          sessionId: ctx.params.sessionId,
+          text,
+        })) {
+          switch (event.type) {
+            case "session_update":
+              await ctx.client.notify(acp.methods.client.session.update, {
+                sessionId: ctx.params.sessionId,
+                update: event.update,
+              });
+              break;
+            case "permission_request":
+              relayPermissionRequestToConsumer(dbPromise, ctx.client, ctx.params.sessionId, event);
+              break;
+            case "permission_resolved":
+              // No ACP-native notification for this — it is purely dashboard
+              // display; the consumer already knows its own answer.
+              break;
+            case "note":
+              // Unreachable on this path in practice: notes only describe what
+              // happened to an attachment, and this relay forwards no
+              // attachments (`contentBlocksToPromptText` reduces the consumer's
+              // content blocks to text above). Even if one appeared, ACP has no
+              // notification for a client-side remark, and forwarding it as an
+              // `agent_message_chunk` would put the Router's words in the
+              // agent's mouth.
+              break;
+            case "turn_ended":
+              stopReason = event.stopReason;
+              break;
+            case "session_ended":
+              throw new Error(event.reason);
+            default: {
+              const exhaustive: never = event;
+              throw new Error(`unhandled session event: ${JSON.stringify(exhaustive)}`);
+            }
           }
         }
-      }
-      return { stopReason };
-    })
-    .onNotification(acp.methods.agent.session.cancel, async (ctx) => {
-      const identity = await requireIdentity();
-      const db = await dbPromise;
-      await endAgentSession(db, { agentId: identity.agentId, sessionId: ctx.params.sessionId });
-    });
+        return { stopReason };
+      }),
+    )
+    .onNotification(acp.methods.agent.session.cancel, (ctx) =>
+      withIdentity(async (db, identity) => {
+        await requireSession(db, identity, ctx.params.sessionId);
+        await endAgentSession(db, { agentId: identity.agentId, sessionId: ctx.params.sessionId });
+      }),
+    );
 }

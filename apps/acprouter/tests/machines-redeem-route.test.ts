@@ -41,7 +41,12 @@ describe("POST /api/v1/machines/redeem", () => {
     const response = await postRedeem({ token: minted.token, label: "test-machine" });
     expect(response.status).toBe(200);
     const body = await response.json();
+    // Legacy (no-grantId) redeem response shape must stay byte-for-byte
+    // identical to what it was before the oauth-enrollment feature existed —
+    // `bridgeCredential` must be ABSENT entirely (not even present as
+    // `null`), so this is a strict `toEqual`, not `toMatchObject`.
     expect(body).toEqual({ machineId: minted.machineId, intendedAgentSlug: null });
+    expect(Object.hasOwn(body, "bridgeCredential")).toBe(false);
   });
 
   it("returns the mint dialog's intendedAgentSlug so the CLI can detect the right tool", async () => {
@@ -55,6 +60,7 @@ describe("POST /api/v1/machines/redeem", () => {
     const response = await postRedeem({ token: minted.token });
     const body = await response.json();
     expect(body).toEqual({ machineId: minted.machineId, intendedAgentSlug: "claude-acp" });
+    expect(Object.hasOwn(body, "bridgeCredential")).toBe(false);
   });
 
   it("refuses a malformed body with 400, not a crash", async () => {

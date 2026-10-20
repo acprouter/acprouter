@@ -1,15 +1,29 @@
+"use client";
+
 import { Separator } from "kui/separator";
 import { SidebarInset, SidebarProvider, SidebarTrigger } from "kui/sidebar";
 import { cn } from "kui/utils";
-import type * as React from "react";
+import * as React from "react";
 import { AppSidebar } from "./AppSidebar";
-import type { AppBranding, NavGroup, NavUserLabels, Space, UserData, UserMenuItem } from "./types";
+import { SidebarResizeHandle, useRestoreSidebarWidth } from "./SidebarResizeHandle";
+import type {
+  AppBranding,
+  NavGroup,
+  NavMainLabels,
+  NavUserLabels,
+  Space,
+  UserData,
+  UserMenuItem,
+} from "./types";
 
 interface DashboardLayoutProps {
   children: React.ReactNode;
   breadcrumbs?: React.ReactNode;
   defaultOpen?: boolean;
   navMain?: NavGroup[];
+  navMainLabels?: NavMainLabels;
+  mobileSidebarLabels?: { title: string; description: string };
+  resizeSidebarLabel?: string;
   spaces?: Space[];
   activeSpace?: Space;
   onSpaceChange?: (space: Space) => void;
@@ -105,6 +119,9 @@ export function DashboardLayout({
   breadcrumbs,
   defaultOpen = true,
   navMain,
+  navMainLabels,
+  mobileSidebarLabels,
+  resizeSidebarLabel,
   spaces,
   activeSpace,
   onSpaceChange,
@@ -141,8 +158,12 @@ export function DashboardLayout({
   onTaskListExpandToggle,
   onSpaceSelectorFocusMode,
 }: DashboardLayoutProps) {
+  const sidebarWrapperRef = React.useRef<HTMLDivElement>(null);
+  useRestoreSidebarWidth(sidebarWrapperRef);
+
   return (
     <SidebarProvider
+      ref={sidebarWrapperRef}
       defaultOpen={defaultOpen}
       className={cn(
         // Override min-h-svh to h-full so the layout respects parent container height
@@ -154,6 +175,8 @@ export function DashboardLayout({
       <AppSidebar
         className={sidebarClassName}
         navMain={navMain}
+        navMainLabels={navMainLabels}
+        mobileSidebarLabels={mobileSidebarLabels}
         spaces={spaces}
         activeSpace={activeSpace}
         onSpaceChange={onSpaceChange}
@@ -183,6 +206,7 @@ export function DashboardLayout({
         onTaskListExpandToggle={onTaskListExpandToggle}
         onSpaceSelectorFocusMode={onSpaceSelectorFocusMode}
       />
+      <SidebarResizeHandle wrapperRef={sidebarWrapperRef} label={resizeSidebarLabel} />
       <SidebarInset className="!min-h-0 flex flex-col overflow-hidden">
         <header
           className={cn(

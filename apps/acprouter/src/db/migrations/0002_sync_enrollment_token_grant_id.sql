@@ -1,0 +1,2 @@
+ALTER TABLE "acprouter_enrollment_tokens" ADD COLUMN "grant_id" text;--> statement-breakpoint
+ALTER TABLE "acprouter_enrollment_tokens" ADD CONSTRAINT "acprouter_enrollment_tokens_grant_id_acprouter_router_enrollment_grants_id_fk" FOREIGN KEY ("grant_id") REFERENCES "public"."acprouter_router_enrollment_grants"("id") ON DELETE no action ON UPDATE no action;

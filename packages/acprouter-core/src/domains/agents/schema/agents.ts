@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import { index, jsonb, pgTable, text, timestamp, uniqueIndex } from "drizzle-orm/pg-core";
 import { acprouterMachines } from "./machines";
 
@@ -45,6 +46,14 @@ export const acprouterAgents = pgTable(
     status: text("status").$type<AgentStatus>().notNull().default("disconnected"),
     createdAt: timestamp("created_at", { mode: "date" }).defaultNow().notNull(),
     updatedAt: timestamp("updated_at", { mode: "date" }).defaultNow().notNull(),
+    // Soft-delete marker for the "remove a disconnected agent" capability —
+    // never a hard DELETE, since four other tables carry a NOT NULL,
+    // onDelete-less FK to this table's id (agent-credentials, agent-sessions,
+    // consumer-api-keys, usage-records), matching the existing
+    // `acprouter_consumer_api_keys.revokedAt` precedent. Every read path
+    // (`listAgents`, `getAgentById`, `upsertBridgedAgent`'s lookup) filters
+    // this `IS NULL`.
+    deletedAt: timestamp("deleted_at", { mode: "date" }),
   },
   (table) => [
     index("acprouter_agents_owner_idx").on(table.ownerId),
@@ -56,10 +65,15 @@ export const acprouterAgents = pgTable(
     // inventing a second lookup id. `remote-acp` rows (`machineId` NULL)
     // don't use this pairing at all, and Postgres treats NULLs as distinct
     // in a unique index, so they're unaffected.
-    uniqueIndex("acprouter_agents_machine_registry_slug_idx").on(
-      table.machineId,
-      table.registrySlug,
-    ),
+    //
+    // Scoped to `deletedAt IS NULL` (a partial index): once an agent is
+    // removed (soft-deleted), its old (machineId, registrySlug) pair must
+    // stop being enforced as unique, or a later reconnect's insert of a
+    // brand-new row for that same pair would fail with a unique-constraint
+    // violation against the still-indexed, soft-deleted row.
+    uniqueIndex("acprouter_agents_machine_registry_slug_idx")
+      .on(table.machineId, table.registrySlug)
+      .where(sql`${table.deletedAt} IS NULL`),
   ],
 );
 

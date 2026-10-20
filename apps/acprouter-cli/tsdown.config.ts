@@ -1,4 +1,4 @@
-import { defineConfig } from "tsup";
+import { defineConfig } from "tsdown";
 
 // `@acprouter/contract` and `@acprouter/core` ship TypeScript source (workspace
 // packages, not published runtime deps a consumer would have installed), so
@@ -13,4 +13,7 @@ export default defineConfig({
   clean: true,
   dts: false,
   noExternal: [/^@acprouter\//],
+  // package.json's bin script expects `dist/cli.js` — tsdown's default with
+  // platform: "node" resolves to `.mjs` instead (established gotcha, PR #6548).
+  outExtensions: () => ({ js: ".js" }),
 });

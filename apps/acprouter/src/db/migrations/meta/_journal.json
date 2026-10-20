@@ -8,6 +8,48 @@
       "when": 1787051113269,
       "tag": "0000_high_korath",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1791963134260,
+      "tag": "0001_sync_machine_enrollment_via_bridge_credential",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1791963195353,
+      "tag": "0002_sync_enrollment_token_grant_id",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1791964335570,
+      "tag": "0003_sync_machine_bridge_deadline_connected_at",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1791966814408,
+      "tag": "0004_sync_enrollment_completions",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1791969013753,
+      "tag": "0005_sync_enrollment_completion_activated_at",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1792119345312,
+      "tag": "0006_pul352_remove_disconnected_agent",
+      "breakpoints": true
     }
   ]
 }

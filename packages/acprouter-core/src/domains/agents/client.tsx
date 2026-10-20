@@ -4,6 +4,7 @@ import type { agentsContract } from "@acprouter/contract";
 import { createORPCClient } from "@orpc/client";
 import { RPCLink } from "@orpc/client/fetch";
 import type { ContractRouterClient } from "@orpc/contract";
+import { resolveDemoMode } from "openlib/ui/dashboard";
 import { createContext, useContext, useMemo } from "react";
 
 export type AcprouterAgentsClient = ContractRouterClient<{ agents: typeof agentsContract }>;
@@ -35,9 +36,20 @@ function resolveApiUrl(apiBasePath: string): string {
  * they're mounted at apps/acprouter's `/api/rpc` or a different host app's
  * oRPC endpoint.
  */
+/**
+ * Carry the page's demo mode on every call, exactly like each host app's own
+ * internal client: without it a `?demo=` page reaches the real router as a
+ * signed-out visitor and every agents call fails instead of returning demo data.
+ */
+function demoHeaders(): Record<string, string> {
+  const demo = resolveDemoMode().useCase;
+  return demo ? { "x-demo-mode": demo } : {};
+}
+
 export function createAcprouterAgentsClient(apiBasePath: string): AcprouterAgentsClient {
   const link = new RPCLink({
     url: () => resolveApiUrl(apiBasePath),
+    headers: demoHeaders,
   });
   return createORPCClient(link);
 }

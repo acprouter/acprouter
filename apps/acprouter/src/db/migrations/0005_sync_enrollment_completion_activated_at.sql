@@ -1,0 +1,1 @@
+ALTER TABLE "acprouter_enrollment_completions" ADD COLUMN "activated_at" timestamp;

@@ -8,6 +8,10 @@ export {
   AgentVOSchema,
   type ConnectRemoteAcpAgentInput,
   ConnectRemoteAcpAgentInputSchema,
+  type RemoveAgentInput,
+  RemoveAgentInputSchema,
+  type RemoveAgentOutput,
+  RemoveAgentOutputSchema,
 } from "./types/agent";
 export { type AgentCatalogEntryVO, AgentCatalogEntryVOSchema } from "./types/agent-catalog";
 export {
@@ -17,12 +21,16 @@ export {
   AnswerAgentSessionPermissionInputSchema,
   type AnswerAgentSessionPermissionOutput,
   AnswerAgentSessionPermissionOutputSchema,
+  type CancelAgentTurnInput,
+  CancelAgentTurnInputSchema,
   type EndAgentSessionInput,
   EndAgentSessionInputSchema,
   type GetAgentSessionHistoryInput,
   GetAgentSessionHistoryInputSchema,
   type PromptAgentSessionInput,
   PromptAgentSessionInputSchema,
+  type PromptAttachmentInput,
+  PromptAttachmentInputSchema,
   type StartAgentSessionInput,
   StartAgentSessionInputSchema,
   type StartAgentSessionOutput,
@@ -31,9 +39,16 @@ export {
 export {
   type BridgeInitializeMeta,
   BridgeInitializeMetaSchema,
+  type BridgeSessionMeta,
+  BridgeSessionMetaSchema,
   parseBridgeInitializeMeta,
+  parseBridgeSessionMeta,
 } from "./types/bridge-meta";
 export {
+  type ActivateEnrollmentCompletionInput,
+  ActivateEnrollmentCompletionInputSchema,
+  type ActivateEnrollmentCompletionOutput,
+  ActivateEnrollmentCompletionOutputSchema,
   type ConsumerApiKeyVO,
   ConsumerApiKeyVOSchema,
   type ListConsumerApiKeysInput,
@@ -42,10 +57,18 @@ export {
   MintConsumerApiKeyInputSchema,
   type MintConsumerApiKeyOutput,
   MintConsumerApiKeyOutputSchema,
+  type RegisterConsumerKeyHashInput,
+  RegisterConsumerKeyHashInputSchema,
+  type RegisterConsumerKeyHashOutput,
+  RegisterConsumerKeyHashOutputSchema,
   type RevokeConsumerApiKeyInput,
   RevokeConsumerApiKeyInputSchema,
   type RevokeConsumerApiKeyOutput,
   RevokeConsumerApiKeyOutputSchema,
+  type RevokeEnrollmentDeviceInput,
+  RevokeEnrollmentDeviceInputSchema,
+  type RevokeEnrollmentDeviceOutput,
+  RevokeEnrollmentDeviceOutputSchema,
 } from "./types/consumer-api-key";
 export {
   type MachineStatus,

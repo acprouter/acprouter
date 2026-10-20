@@ -12,25 +12,49 @@ export {
   encryptAgentApiKey,
 } from "./domains/agents/logic/agent-credential-crypto";
 export {
+  getAgentByMachineId,
   listAgents,
   markAgentsDisconnected,
+  removeAgent,
   toAgentVO,
   type UpsertBridgedAgentInput,
   upsertBridgedAgent,
 } from "./domains/agents/logic/agents-logic";
 export {
+  type BudaOAuthState,
+  createBudaOAuthState,
+  readBudaOAuthState,
+} from "./domains/agents/logic/buda-oauth-state";
+export {
   createConsumerAcpAgentApp,
   resolveConsumerAcpAuth,
 } from "./domains/agents/logic/consumer-acp-connection";
 export {
+  type ConsumerAcpSocketLike,
+  closeConsumerAcpConnection,
+  getConsumerAcpConnections,
+  listConsumerAcpConnections,
+  registerConsumerAcpConnection,
+  unregisterConsumerAcpConnection,
+} from "./domains/agents/logic/consumer-acp-registry";
+export {
+  type ActivateEnrollmentCompletionResult,
+  activateEnrollmentCompletion,
+  isConsumerApiKeyLive,
   listConsumerApiKeys,
   mintConsumerApiKey,
+  type RegisterConsumerKeyHashResult,
+  reconcileConsumerAcpConnections,
+  registerConsumerKeyHash,
+  resolveConsumerApiKeyId,
   revokeConsumerApiKey,
   validateConsumerApiKey,
 } from "./domains/agents/logic/consumer-api-keys-logic";
+export { revokeRouterEnrollmentGrantCascadeCore } from "./domains/agents/logic/grant-revocation-cascade-core";
 export {
   acceptMachineBridgeConnection,
   MACHINE_BRIDGE_CLOSE_CODE,
+  type PresentedBridgeCredential,
 } from "./domains/agents/logic/machine-bridge-connection";
 export {
   getMachineBridge,
@@ -39,14 +63,23 @@ export {
   unregisterMachineBridge,
 } from "./domains/agents/logic/machine-bridge-registry";
 export {
+  type BridgeCredentialCheckResult,
+  cleanupAbandonedEnrollmentCompletions,
+  type GrantEnrollmentStatus,
+  getGrantEnrollmentStatus,
   getMachineOwnerId,
   listMachines,
   machineExists,
   markMachineOffline,
   markMachineOnline,
   mintEnrollmentToken,
+  mintGrantEnrollmentToken,
   RedeemEnrollmentTokenError,
+  type RevokeEnrollmentDeviceResult,
   redeemEnrollmentToken,
+  revokeEnrollmentDevice,
+  type VerifyLiveGrantFn,
+  verifyMachineBridgeCredential,
 } from "./domains/agents/logic/machines-logic";
 export {
   fetchProtocolMatrix,
@@ -56,11 +89,15 @@ export {
   type RegistryCapabilities,
   type RegistryDistribution,
 } from "./domains/agents/logic/registry-sync";
+export { resolveRemoteAcpBearerToken } from "./domains/agents/logic/remote-agent-credential";
 export {
+  type ConnectOAuthRemoteAcpAgentInput,
   type ConnectRemoteAcpAgentInput,
+  connectOAuthRemoteAcpAgent,
   connectRemoteAcpAgent,
   dialRemoteAcpSocket,
   getAgentCredentialById,
+  getBudaOAuthOrigin,
   performAcpInitializeHandshake,
 } from "./domains/agents/logic/remote-agents-logic";
 export {
@@ -99,8 +136,14 @@ export {
 } from "./domains/agents/logic/session-status-logic";
 export {
   answerAgentSessionPermission,
+  cancelAgentTurn,
   endAgentSession,
   promptAgentSession,
   startAgentSession,
 } from "./domains/agents/logic/sessions-logic";
+export {
+  type BudaTokenResponse,
+  parseBudaTokenResponse,
+  safeJsonParse,
+} from "./domains/agents/logic/stored-oauth-credential";
 export { agentsRouter } from "./domains/agents/router";

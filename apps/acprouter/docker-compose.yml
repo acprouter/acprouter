@@ -25,6 +25,10 @@ services:
       dockerfile: apps/acprouter/Dockerfile
     environment:
       PG_DATABASE_URL: postgres://acprouter:${POSTGRES_PASSWORD:-acprouter}@postgres:5432/acprouter
+      # Public browser-facing origin embedded in enrollment commands. This is
+      # read when the container starts, so one image can serve any deployment.
+      ACPROUTER_PUBLIC_URL: ${ACPROUTER_PUBLIC_URL:-}
+      NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL:-}
       # The banner from task #16 (spec §8.1 point 3) would otherwise warn
       # every operator who did this correctly — a real reverse proxy really
       # is in front of this instance in this topology, so tell the app so.

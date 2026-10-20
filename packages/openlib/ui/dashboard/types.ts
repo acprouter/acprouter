@@ -1,4 +1,5 @@
 import type { LucideIcon } from "lucide-react";
+import type { ReactNode } from "react";
 
 export interface NavItemAction {
   title: string;
@@ -80,6 +81,25 @@ export interface NavItem {
    */
   badge?: string | number;
   /**
+   * Optional persistent status icon at the trailing edge of the row — a state
+   * marker (e.g. "this node is publicly shared"), NOT an action: no click
+   * handler, skipped by the keyboard order.
+   *
+   * Unlike the hover cluster (`renderRowActions`) this is visible while the row
+   * is IDLE, which is the whole point — you can scan a tree for the marked rows
+   * without hovering each one. It shares that cluster's trailing slot, so it
+   * fades out on hover/focus exactly as the controls fade in.
+   */
+  statusIcon?: LucideIcon;
+  /** Tooltip/accessible label for `statusIcon`. Required for it to render. */
+  statusIconTitle?: string;
+  /**
+   * `muted` draws `statusIcon` a step fainter — for a state the row inherits
+   * rather than carries itself (e.g. public only because a parent folder is
+   * shared), so it reads as secondary next to the rows that own the state.
+   */
+  statusIconTone?: "default" | "muted";
+  /**
    * Optional space name for recent task items
    */
   spaceName?: string;
@@ -91,6 +111,8 @@ export interface NavItem {
    * Optional status for recent task items
    */
   status?: "pending" | "in_progress" | "waiting_for_input" | "completed" | "failed" | "cancelled";
+  /** Structured creation source for recent session items. */
+  source?: "acp" | null;
 }
 
 export interface NavGroup {
@@ -134,6 +156,34 @@ export interface NavGroup {
    * Default visible count before expansion
    */
   defaultVisibleCount?: number;
+  /**
+   * Whether this group's rows participate in drag-and-drop (requires NavMain's
+   * `onNodeDrop`). Opt-in per group, NOT "every non-dynamic group", because a
+   * group may legitimately render rows for ids that ANOTHER group already
+   * renders — busabase's Favorites shows the same nodes as the Workspace tree.
+   * Registering one dnd-kit id from two DOM rows made the drop indicator light
+   * up on both rows at once and left it ambiguous which one a drop referred to.
+   * Only the group that owns the canonical tree should set this.
+   */
+  draggable?: boolean;
+  /**
+   * Replaces the plain text inside this group's `SidebarGroupLabel` with custom
+   * content — e.g. a dropdown that filters the group. Purely presentational:
+   * `label` is still required and is still both the React key and the argument
+   * handed to `onHeaderActionClick`, so the group's `+` action keeps working.
+   */
+  labelSlot?: ReactNode;
+}
+
+/** Labels for the built-in sidebar actions; omitted labels retain English defaults. */
+export interface NavMainLabels {
+  dragToReorder?: string;
+  new?: string;
+  delete?: string;
+  more?: string;
+  toggle?: string;
+  expand?: string;
+  collapse?: string;
 }
 
 export interface Space {
@@ -202,6 +252,14 @@ export interface UserMenuItem {
   icon?: React.ComponentType<{ className?: string }>;
   external?: boolean;
   onClick?: () => void;
+  /**
+   * Draw a separator above this item, so it reads as the head of its own
+   * section rather than one more line in a long list. Use it for the few
+   * entries that must not be scanned past — a support channel buried tenth in
+   * an undifferentiated list is effectively invisible. Ignored on the first
+   * item (the group already has a separator above it).
+   */
+  startsSection?: boolean;
 }
 
 export interface AppBranding {

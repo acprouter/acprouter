@@ -26,7 +26,7 @@ import "server-only";
  * lost, and a rejected/missing key surfaces as a normal JSON-RPC error
  * response to `initialize` rather than an opaque pre-upgrade close.
  *
- * Keepalive (task #14 point 4) is wired directly on the raw socket here,
+ * Keepalive (task #11, spec §5.5a) is wired directly on the raw socket here,
  * not inside `consumer-acp-connection.ts` — `AcpServer.prepareWebSocketUpgrade
  * ().accept()` returns `void`, giving that module no connection handle of its
  * own to hook a "closed" cleanup on, whereas the raw `client` socket handed
@@ -34,12 +34,18 @@ import "server-only";
  * `machine-bridge-connection.ts` does for the OTHER leg of this same
  * problem — reusing `ws-keepalive.ts` (task #11) rather than a second
  * implementation, per this task's own scope note.
+ *
+ * Revoke-aware closing reuses this exact raw-socket handle for the identical
+ * reason — see `consumer-acp-registry.ts`'s own doc comment for the full
+ * reasoning.
  */
 
 import {
   createConsumerAcpAgentApp,
+  registerConsumerAcpConnection,
   resolveConsumerAcpAuth,
   runWithLocalContext,
+  unregisterConsumerAcpConnection,
 } from "@acprouter/core";
 import { startWebSocketKeepalive } from "@acprouter/core/ws-keepalive";
 import { AcpServer } from "@agentclientprotocol/sdk/experimental/server";
@@ -76,6 +82,15 @@ export function UPGRADE(
     server.prepareWebSocketUpgrade().accept(client);
 
     const stopKeepalive = startWebSocketKeepalive(client);
-    client.on("close", stopKeepalive);
+    let registeredKeyId: string | null = null;
+    void identityPromise.then((identity) => {
+      if (!identity) return;
+      registeredKeyId = identity.keyId;
+      registerConsumerAcpConnection(identity.keyId, identity.agentId, client);
+    });
+    client.on("close", () => {
+      stopKeepalive();
+      if (registeredKeyId) unregisterConsumerAcpConnection(registeredKeyId, client);
+    });
   });
 }
