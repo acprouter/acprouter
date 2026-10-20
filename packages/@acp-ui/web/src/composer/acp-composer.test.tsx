@@ -1,0 +1,859 @@
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { describe, expect, it, vi } from "vitest";
+import {
+  AcpComposer,
+  getCommandQuery,
+  insertCommand,
+  mergeDraft,
+  toAttachments,
+} from "./acp-composer";
+
+const submitButton = () => screen.getByRole("button", { name: /Submit|Stop/ });
+const attachButton = () => screen.getByRole("button", { name: "Attach a file" });
+
+describe("sending", () => {
+  it("sends the trimmed text on Enter and clears the field", async () => {
+    const onSend = vi.fn();
+    render(<AcpComposer disabled={false} onSend={onSend} />);
+    const box = screen.getByRole("textbox");
+    await userEvent.type(box, "  hello  {Enter}");
+    expect(onSend).toHaveBeenCalledWith("hello", undefined);
+    expect(box).toHaveValue("");
+  });
+
+  it("does not send on Shift+Enter — inserts a newline instead", async () => {
+    const onSend = vi.fn();
+    render(<AcpComposer disabled={false} onSend={onSend} />);
+    const box = screen.getByRole("textbox");
+    await userEvent.type(box, "line one{Shift>}{Enter}{/Shift}line two");
+    expect(onSend).not.toHaveBeenCalled();
+    expect(box).toHaveValue("line one\nline two");
+  });
+
+  it("does not send empty or whitespace-only input", async () => {
+    const onSend = vi.fn();
+    render(<AcpComposer disabled={false} onSend={onSend} />);
+    await userEvent.type(screen.getByRole("textbox"), "   {Enter}");
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  // kui's own Enter-to-submit guard checks the submit button's `disabled`
+  // attribute, but nothing disables it just for an empty field — emptiness is
+  // guarded in `handleSubmit` itself (the test above), not at the button.
+  it("a click on an enabled-but-empty field sends nothing", async () => {
+    const onSend = vi.fn();
+    render(<AcpComposer disabled={false} onSend={onSend} />);
+    await userEvent.click(submitButton());
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("sending works via a click on the submit button, not just Enter", async () => {
+    const onSend = vi.fn();
+    render(<AcpComposer disabled={false} onSend={onSend} />);
+    await userEvent.type(screen.getByRole("textbox"), "hi");
+    const button = submitButton();
+    expect(button).toBeEnabled();
+    await userEvent.click(button);
+    expect(onSend).toHaveBeenCalledWith("hi", undefined);
+  });
+});
+
+describe("ACP slash commands", () => {
+  const commands = [
+    { name: "compact", description: "Compact the conversation" },
+    { name: "plan", description: "Create a plan", input: { hint: "what to plan" } },
+  ];
+
+  it("recognizes only a trailing slash token", () => {
+    expect(getCommandQuery("/")).toBe("");
+    expect(getCommandQuery("please /pl")).toBe("pl");
+    expect(getCommandQuery("/plan with context")).toBeNull();
+  });
+
+  it("inserts a selected command and leaves argument commands ready for typing", () => {
+    expect(
+      insertCommand("please /pl", {
+        name: "plan",
+        description: "Create a plan",
+        input: { hint: "what to plan" },
+      }),
+    ).toBe("please /plan ");
+    expect(insertCommand("/co", { name: "compact", description: "Compact the conversation" })).toBe(
+      "/compact",
+    );
+  });
+
+  it("filters advertised commands and inserts the selected command with Enter", async () => {
+    render(<AcpComposer availableCommands={commands} disabled={false} onSend={vi.fn()} />);
+    const box = screen.getByRole("textbox");
+    await userEvent.type(box, "/pl");
+    expect(screen.getByRole("listbox", { name: "Available commands" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /\/plan.*Create a plan/i })).toBeInTheDocument();
+    await userEvent.keyboard("{Enter}");
+    expect(box).toHaveValue("/plan ");
+    expect(screen.queryByRole("listbox", { name: "Available commands" })).not.toBeInTheDocument();
+  });
+
+  it("inserts a clicked command without sending it", async () => {
+    const onSend = vi.fn();
+    render(<AcpComposer availableCommands={commands} disabled={false} onSend={onSend} />);
+    const box = screen.getByRole("textbox");
+    await userEvent.type(box, "/co");
+    await userEvent.click(screen.getByRole("option", { name: /\/compact/i }));
+    expect(box).toHaveValue("/compact");
+    expect(box).toHaveFocus();
+    expect(onSend).not.toHaveBeenCalled();
+    expect(screen.queryByRole("listbox", { name: "Available commands" })).not.toBeInTheDocument();
+  });
+
+  it("navigates commands with arrows and dismisses the palette with Escape", async () => {
+    render(<AcpComposer availableCommands={commands} disabled={false} onSend={vi.fn()} />);
+    const box = screen.getByRole("textbox");
+    await userEvent.type(box, "/");
+    await userEvent.keyboard("{ArrowDown}{Enter}");
+    expect(box).toHaveValue("/plan ");
+    await userEvent.clear(box);
+    await userEvent.type(box, "/");
+    await userEvent.keyboard("{Escape}");
+    expect(screen.queryByRole("listbox", { name: "Available commands" })).not.toBeInTheDocument();
+    expect(box).toHaveValue("/");
+  });
+
+  it("connects the textarea to the active listbox option without a combobox role", async () => {
+    render(<AcpComposer availableCommands={commands} disabled={false} onSend={vi.fn()} />);
+    const box = screen.getByRole("textbox");
+    await userEvent.type(box, "/");
+    const listbox = screen.getByRole("listbox", { name: "Available commands" });
+    const option = screen.getAllByRole("option")[0];
+    expect(box).toHaveAttribute("aria-controls", listbox.id);
+    expect(box).toHaveAttribute("aria-autocomplete", "list");
+    expect(box).toHaveAttribute("aria-activedescendant", option.id);
+    expect(option).toHaveAttribute("aria-selected", "true");
+    expect(box).not.toHaveAttribute("role", "combobox");
+  });
+
+  it("keeps the active command valid when commands reorder or shrink", async () => {
+    const { rerender } = render(
+      <AcpComposer availableCommands={commands} disabled={false} onSend={vi.fn()} />,
+    );
+    const box = screen.getByRole("textbox");
+    await userEvent.type(box, "/");
+    await userEvent.keyboard("{ArrowDown}");
+    rerender(
+      <AcpComposer
+        availableCommands={[commands[1], commands[0]]}
+        disabled={false}
+        onSend={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("option", { name: /\/plan/ })).toHaveAttribute("aria-selected", "true");
+    await userEvent.keyboard("{Enter}");
+    expect(box).toHaveValue("/plan ");
+
+    await userEvent.clear(box);
+    await userEvent.type(box, "/");
+    await userEvent.keyboard("{ArrowDown}");
+    rerender(<AcpComposer availableCommands={[commands[1]]} disabled={false} onSend={vi.fn()} />);
+    const remaining = screen.getByRole("option", { name: /\/plan/ });
+    expect(remaining).toHaveAttribute("aria-selected", "true");
+    expect(box).toHaveAttribute("aria-activedescendant", remaining.id);
+  });
+
+  it.each(["ArrowUp", "ArrowDown", "Enter", "Tab", "Escape"])(
+    "does not handle %s for the slash palette during IME composition",
+    async (key) => {
+      const onSend = vi.fn();
+      render(<AcpComposer availableCommands={commands} disabled={false} onSend={onSend} />);
+      const box = screen.getByRole("textbox");
+      await userEvent.type(box, "/");
+      const activeId = box.getAttribute("aria-activedescendant");
+      fireEvent.keyDown(box, { key, isComposing: true });
+      expect(box).toHaveValue("/");
+      expect(box).toHaveAttribute("aria-activedescendant", activeId);
+      expect(screen.getByRole("listbox", { name: "Available commands" })).toBeInTheDocument();
+      expect(onSend).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["ArrowUp", "ArrowDown", "Enter", "Tab", "Escape"])(
+    "leaves legacy keyCode 229 native for %s during active IME composition",
+    async (key) => {
+      const onSend = vi.fn();
+      render(<AcpComposer availableCommands={commands} disabled={false} onSend={onSend} />);
+      const box = screen.getByRole("textbox");
+      await userEvent.type(box, "/");
+      const activeId = box.getAttribute("aria-activedescendant");
+      fireEvent.compositionStart(box);
+      const event = new KeyboardEvent("keydown", {
+        bubbles: true,
+        cancelable: true,
+        key,
+      });
+      Object.defineProperty(event, "keyCode", { value: 229 });
+      box.dispatchEvent(event);
+      expect(event.defaultPrevented).toBe(false);
+      expect(box).toHaveValue("/");
+      expect(box).toHaveAttribute("aria-activedescendant", activeId);
+      expect(screen.getByRole("listbox", { name: "Available commands" })).toBeInTheDocument();
+      expect(onSend).not.toHaveBeenCalled();
+    },
+  );
+
+  it("blocks a trailing legacy Enter/229 after composition ends without an open palette", async () => {
+    const onSend = vi.fn();
+    render(<AcpComposer availableCommands={[]} disabled={false} onSend={onSend} />);
+    const box = screen.getByRole("textbox");
+    await userEvent.type(box, "/");
+    expect(screen.queryByRole("listbox", { name: "Available commands" })).not.toBeInTheDocument();
+    fireEvent.compositionStart(box);
+    fireEvent.compositionEnd(box);
+    const event = new KeyboardEvent("keydown", {
+      bubbles: true,
+      cancelable: true,
+      key: "Enter",
+    });
+    Object.defineProperty(event, "keyCode", { value: 229 });
+    box.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(true);
+    expect(box).toHaveValue("/");
+    expect(onSend).not.toHaveBeenCalled();
+  });
+});
+
+// A long description, an unbroken token, or an embedded newline previously
+// wrapped onto a second line and grew the row. `truncate` clips the
+// description span to one visual line without touching the full text kept in
+// the DOM, filtering, or selection.
+describe("command palette description truncation", () => {
+  const longDescription =
+    "This command runs a very long diagnostic sweep across the entire workspace configuration and reports every finding it discovers along the way";
+
+  it("aligns the popup with the full-width conversation input region", async () => {
+    render(
+      <AcpComposer
+        availableCommands={[{ name: "diagnose", description: longDescription }]}
+        disabled={false}
+        onSend={vi.fn()}
+      />,
+    );
+    await userEvent.type(screen.getByRole("textbox"), "/di");
+    const listbox = screen.getByRole("listbox", { name: "Available commands" });
+    expect(listbox).toHaveClass("left-0", "w-full");
+    expect(listbox).not.toHaveAttribute("style");
+    expect(listbox.parentElement).toHaveClass("relative", "w-full");
+  });
+
+  it("puts truncate and min-w-0 on the description span, not the option button", async () => {
+    render(
+      <AcpComposer
+        availableCommands={[{ name: "diagnose", description: longDescription }]}
+        disabled={false}
+        onSend={vi.fn()}
+      />,
+    );
+    await userEvent.type(screen.getByRole("textbox"), "/di");
+    const option = screen.getByRole("option", { name: /\/diagnose/ });
+    expect(option.className).not.toContain("truncate");
+    // biome-ignore lint/style/noNonNullAssertion: the description span is always the option's second child
+    const descriptionSpan = option.lastElementChild!;
+    expect(descriptionSpan).toHaveClass("min-w-0", "truncate");
+  });
+
+  it("keeps the full description and hint as raw DOM text, including an embedded newline", async () => {
+    const withNewline = "Line one\nLine two of the description";
+    render(
+      <AcpComposer
+        availableCommands={[
+          { name: "wrap", description: withNewline, input: { hint: "extra context" } },
+        ]}
+        disabled={false}
+        onSend={vi.fn()}
+      />,
+    );
+    await userEvent.type(screen.getByRole("textbox"), "/wr");
+    const option = screen.getByRole("option", { name: /\/wrap/ });
+    // biome-ignore lint/style/noNonNullAssertion: the description span is always the option's second child
+    const descriptionSpan = option.lastElementChild!;
+    // textContent, not a whitespace-normalizing matcher like toHaveTextContent —
+    // truncation is CSS-only, so the raw newline must still be in the DOM.
+    expect(descriptionSpan.textContent).toBe(`${withNewline} - extra context`);
+  });
+
+  it("still matches and selects a command by a unique substring near the end of a long description, without sending", async () => {
+    const onSend = vi.fn();
+    render(
+      <AcpComposer
+        availableCommands={[
+          { name: "diagnose", description: longDescription },
+          { name: "compact", description: "Compact the conversation" },
+        ]}
+        disabled={false}
+        onSend={onSend}
+      />,
+    );
+    const box = screen.getByRole("textbox");
+    // Unique substring from near the end of the long description — proves
+    // filtering still runs against the full, untruncated string. The command
+    // query is a trailing no-whitespace token (see getCommandQuery), so this
+    // is one unbroken word, not a multi-word phrase.
+    await userEvent.type(box, "/discovers");
+    const option = screen.getByRole("option", { name: /\/diagnose/ });
+    expect(option).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: /\/compact/ })).not.toBeInTheDocument();
+
+    await userEvent.click(option);
+    expect(box).toHaveValue("/diagnose");
+    expect(onSend).not.toHaveBeenCalled();
+    expect(screen.queryByRole("listbox", { name: "Available commands" })).not.toBeInTheDocument();
+  });
+});
+
+// Real gap in both apps' prior hand-rolled textareas: neither guarded against
+// IME composition, so confirming a Chinese/Japanese candidate with Enter would
+// have submitted early. kui's PromptInputTextarea guards this internally.
+describe("IME composition", () => {
+  it("does not submit on the Enter that confirms an IME composition", async () => {
+    const onSend = vi.fn();
+    render(<AcpComposer disabled={false} onSend={onSend} />);
+    const box = screen.getByRole("textbox");
+    act(() => box.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true })));
+    await userEvent.type(box, "日本語");
+    await userEvent.keyboard("{Enter}");
+    expect(onSend).not.toHaveBeenCalled();
+    act(() => box.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true })));
+    await userEvent.keyboard("{Enter}");
+    expect(onSend).toHaveBeenCalledWith("日本語", undefined);
+  });
+});
+
+describe("disabled", () => {
+  it("disables the field and both buttons", () => {
+    render(<AcpComposer disabled={true} onSend={vi.fn()} placeholder="Session ended." />);
+    expect(screen.getByRole("textbox")).toBeDisabled();
+    expect(submitButton()).toBeDisabled();
+    expect(attachButton()).toBeDisabled();
+  });
+
+  it("does not send even if Enter is pressed while disabled", async () => {
+    const onSend = vi.fn();
+    render(<AcpComposer disabled={true} onSend={onSend} />);
+    expect(screen.getByRole("textbox")).toBeDisabled();
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("shows the placeholder host apps pass in", () => {
+    render(<AcpComposer disabled={true} onSend={vi.fn()} placeholder="This session has ended." />);
+    expect(screen.getByPlaceholderText("This session has ended.")).toBeInTheDocument();
+  });
+});
+
+describe("stopping mid-stream", () => {
+  // Both hosts fold `sending` into `disabled`, which would otherwise leave a
+  // freshly-shown stop button unclickable the instant it appears.
+  it("keeps the submit button clickable while sending, when onStop is supplied", () => {
+    render(<AcpComposer disabled={true} onSend={vi.fn()} onStop={vi.fn()} sending={true} />);
+    expect(submitButton()).toBeEnabled();
+  });
+
+  it("calls onStop, not onSend, when clicked while sending", async () => {
+    const onSend = vi.fn();
+    const onStop = vi.fn();
+    render(<AcpComposer disabled={true} onSend={onSend} onStop={onStop} sending={true} />);
+    await userEvent.click(submitButton());
+    expect(onStop).toHaveBeenCalledTimes(1);
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("uses a restrained destructive treatment for Stop only", () => {
+    const { rerender } = render(
+      <AcpComposer disabled={true} onSend={vi.fn()} onStop={vi.fn()} sending={true} />,
+    );
+    expect(submitButton()).toHaveClass(
+      "border-destructive/40",
+      "text-destructive",
+      "hover:bg-destructive/10",
+    );
+
+    rerender(<AcpComposer disabled={false} onSend={vi.fn()} onStop={vi.fn()} sending={false} />);
+    expect(submitButton()).not.toHaveClass("border-destructive/40", "text-destructive");
+  });
+
+  // Without onStop, behavior is exactly what it was before this existed:
+  // the button simply stays disabled while sending.
+  it("stays disabled while sending when no onStop is supplied", () => {
+    render(<AcpComposer disabled={true} onSend={vi.fn()} sending={true} />);
+    expect(submitButton()).toBeDisabled();
+  });
+
+  // A host's OTHER reasons for `disabled` (e.g. the session itself ended)
+  // must still win — the stop carve-out only applies while actually sending.
+  it("stays disabled when disabled for a reason other than sending", () => {
+    render(<AcpComposer disabled={true} onSend={vi.fn()} onStop={vi.fn()} sending={false} />);
+    expect(submitButton()).toBeDisabled();
+  });
+
+  it("the field and attach button stay disabled even though submit is stoppable", () => {
+    render(<AcpComposer disabled={true} onSend={vi.fn()} onStop={vi.fn()} sending={true} />);
+    expect(screen.getByRole("textbox")).toBeDisabled();
+    expect(attachButton()).toBeDisabled();
+  });
+});
+
+/** A File whose real bytes are readable back out by jsdom's Blob/FileReader. */
+const fakeFile = (name: string, type: string, contents = "fake-bytes") =>
+  new File([contents], name, { type });
+
+describe("attaching — via the picker or paste", () => {
+  it("stages a picked file as a preview chip before sending", async () => {
+    render(<AcpComposer disabled={false} onSend={vi.fn()} />);
+    const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+    expect(fileInput).toBeTruthy();
+    await userEvent.upload(fileInput, fakeFile("photo.png", "image/png"));
+    expect(screen.getByRole("img")).toBeInTheDocument();
+  });
+
+  it("removing a staged attachment clears its preview chip", async () => {
+    render(<AcpComposer disabled={false} onSend={vi.fn()} />);
+    const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+    await userEvent.upload(fileInput, fakeFile("photo.png", "image/png"));
+    expect(screen.getByRole("img")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Remove" }));
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+  });
+
+  // The behavior this replaces: pasting used to be blocked entirely so an
+  // image would vanish with no chip and no error. Now it stages exactly like
+  // the picker does.
+  it("pasting an image stages it the same way the picker does", () => {
+    render(<AcpComposer disabled={false} onSend={vi.fn()} />);
+    const box = screen.getByRole("textbox");
+    const file = fakeFile("screenshot.png", "image/png");
+    const pasteEvent = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(pasteEvent, "clipboardData", {
+      value: { items: [{ kind: "file", type: "image/png", getAsFile: () => file }] },
+    });
+    act(() => {
+      box.dispatchEvent(pasteEvent);
+    });
+    expect(screen.getByRole("img")).toBeInTheDocument();
+  });
+
+  it("still pastes plain text normally", async () => {
+    render(<AcpComposer disabled={false} onSend={vi.fn()} />);
+    const box = screen.getByRole("textbox");
+    await userEvent.click(box);
+    await userEvent.paste("pasted text");
+    expect(box).toHaveValue("pasted text");
+  });
+});
+
+// The real, working blob-URL round trip (see test/setup.ts) makes this a
+// genuine integration test of kui's own blob→data-URL conversion, not just of
+// this package's `toAttachments`.
+describe("sending an attachment", () => {
+  it("delivers a real base64 attachment to onSend, and clears the staged preview", async () => {
+    const onSend = vi.fn();
+    render(<AcpComposer disabled={false} onSend={onSend} />);
+    const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+    await userEvent.upload(fileInput, fakeFile("photo.png", "image/png", "hello-bytes"));
+    expect(screen.getByRole("img")).toBeInTheDocument();
+
+    await userEvent.type(screen.getByRole("textbox"), "check this out");
+    await userEvent.click(submitButton());
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
+    const [text, attachments] = onSend.mock.calls[0];
+    expect(text).toBe("check this out");
+    expect(attachments).toHaveLength(1);
+    expect(attachments[0].kind).toBe("image");
+    expect(attachments[0].mimeType).toBe("image/png");
+    // Not asserting the decoded bytes equal "hello-bytes": jsdom's FileReader
+    // doesn't recognize a Blob that came back through Node's native
+    // fetch/Response (confirmed in isolation outside jsdom — the same
+    // Response→blob()→FileReader chain round-trips real bytes correctly
+    // there), so it degenerates to stringifying the File object instead of
+    // reading it. What's real and worth pinning here is everything genuinely
+    // under this package's control: `toAttachments` receives whatever `url`
+    // kui hands it and returns well-formed base64 (checked by decodability),
+    // not that jsdom's Blob plumbing is byte-perfect.
+    expect(() => atob(attachments[0].data)).not.toThrow();
+    expect(attachments[0].data.length).toBeGreaterThan(0);
+
+    // kui's blob→data-URL conversion runs a real `fetch`, so the staged
+    // preview only clears once that microtask chain settles — not
+    // synchronously after the click.
+    await waitFor(() => expect(screen.queryByRole("img")).not.toBeInTheDocument());
+  });
+
+  it("sends an attachment with empty text (image, no caption)", async () => {
+    const onSend = vi.fn();
+    render(<AcpComposer disabled={false} onSend={onSend} />);
+    const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+    await userEvent.upload(fileInput, fakeFile("photo.png", "image/png"));
+    await userEvent.click(submitButton());
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith("", expect.any(Array)));
+  });
+});
+
+describe("toAttachments", () => {
+  it("extracts kind, data, and mimeType from a data: URL", () => {
+    const result = toAttachments([
+      { type: "file", mediaType: "image/jpeg", url: "data:image/jpeg;base64,QUJD" },
+    ]);
+    expect(result).toEqual([{ kind: "image", data: "QUJD", mimeType: "image/jpeg" }]);
+  });
+
+  it('classifies audio/* as kind "audio"', () => {
+    const result = toAttachments([
+      { type: "file", mediaType: "audio/wav", url: "data:audio/wav;base64,QUJD" },
+    ]);
+    expect(result[0].kind).toBe("audio");
+  });
+
+  // Anything that isn't image/audio is a `file` — an ACP embedded resource —
+  // rather than being dropped, which is what "attach a PDF" needs.
+  it('classifies everything else as kind "file", keeping the filename', () => {
+    const result = toAttachments([
+      {
+        type: "file",
+        mediaType: "application/pdf",
+        filename: "report.pdf",
+        url: "data:application/pdf;base64,QUJD",
+      },
+    ]);
+    expect(result).toEqual([
+      { kind: "file", data: "QUJD", mimeType: "application/pdf", filename: "report.pdf" },
+    ]);
+  });
+
+  it("keeps a file the browser could not type at all", () => {
+    // An extensionless `Dockerfile` reports `mediaType: ""`. Falling back to
+    // a MIME type keeps it representable; the bytes decide text-vs-blob later.
+    const result = toAttachments([
+      { type: "file", mediaType: "", filename: "Dockerfile", url: "data:;base64,QUJD" },
+    ]);
+    expect(result).toEqual([
+      { kind: "file", data: "QUJD", mimeType: "application/octet-stream", filename: "Dockerfile" },
+    ]);
+  });
+
+  it("omits filename rather than sending an empty one", () => {
+    const result = toAttachments([
+      { type: "file", mediaType: "application/pdf", url: "data:application/pdf;base64,QUJD" },
+    ]);
+    expect(result[0]).not.toHaveProperty("filename");
+  });
+
+  // If kui's blob→data conversion ever failed and fell back to the original
+  // blob: URL (its own documented behavior on a failed fetch), sending that
+  // verbatim would be meaningless to ACP — better to drop it than send junk.
+  it("drops a file whose url never became a data: URL", () => {
+    const result = toAttachments([
+      { type: "file", mediaType: "image/png", url: "blob:http://localhost/unconverted" },
+    ]);
+    expect(result).toEqual([]);
+  });
+
+  it("returns an empty array for no files", () => {
+    expect(toAttachments([])).toEqual([]);
+  });
+});
+
+// Ask Agent (busabase) drops a prompt into the draft without sending it. The
+// two things that make that safe rather than annoying: never destroying what
+// the user already typed, and never firing twice for one user action.
+describe("prefilling a draft", () => {
+  it("fills an empty composer and leaves it unsent", async () => {
+    const onSend = vi.fn();
+    render(
+      <AcpComposer
+        disabled={false}
+        draft={{ id: "d1", text: "Summarise this doc" }}
+        onSend={onSend}
+      />,
+    );
+
+    await waitFor(() => expect(screen.getByRole("textbox")).toHaveValue("Summarise this doc"));
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("focuses the field and parks the caret at the end, ready to edit", async () => {
+    render(
+      <AcpComposer
+        disabled={false}
+        draft={{ id: "d1", text: "Rename the fields" }}
+        onSend={vi.fn()}
+      />,
+    );
+
+    const box = screen.getByRole("textbox") as HTMLTextAreaElement;
+    await waitFor(() => expect(box).toHaveFocus());
+    expect(box.selectionStart).toBe("Rename the fields".length);
+    expect(box.selectionEnd).toBe("Rename the fields".length);
+  });
+
+  it("appends on a new line instead of eating an unsent draft", async () => {
+    const { rerender } = render(<AcpComposer disabled={false} onSend={vi.fn()} />);
+    await userEvent.type(screen.getByRole("textbox"), "but only last week");
+
+    rerender(
+      <AcpComposer
+        disabled={false}
+        draft={{ id: "d1", text: "Summarise this" }}
+        onSend={vi.fn()}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByRole("textbox")).toHaveValue("but only last week\nSummarise this"),
+    );
+  });
+
+  it("applies a given draft id exactly once, however often it re-renders", async () => {
+    const draft = { id: "d1", text: "Summarise this" };
+    const { rerender } = render(<AcpComposer disabled={false} draft={draft} onSend={vi.fn()} />);
+    await waitFor(() => expect(screen.getByRole("textbox")).toHaveValue("Summarise this"));
+
+    rerender(<AcpComposer disabled={false} draft={{ ...draft }} onSend={vi.fn()} />);
+    await waitFor(() => expect(screen.getByRole("textbox")).toHaveValue("Summarise this"));
+  });
+
+  it("appends again for a new id — a second Ask Agent is a second insertion", async () => {
+    const { rerender } = render(
+      <AcpComposer disabled={false} draft={{ id: "d1", text: "First" }} onSend={vi.fn()} />,
+    );
+    await waitFor(() => expect(screen.getByRole("textbox")).toHaveValue("First"));
+
+    rerender(
+      <AcpComposer disabled={false} draft={{ id: "d2", text: "Second" }} onSend={vi.fn()} />,
+    );
+    await waitFor(() => expect(screen.getByRole("textbox")).toHaveValue("First\nSecond"));
+  });
+
+  it("tells the host the draft landed, so it can retire it", async () => {
+    const onDraftApplied = vi.fn();
+    render(
+      <AcpComposer
+        disabled={false}
+        draft={{ id: "d1", text: "Summarise this" }}
+        onDraftApplied={onDraftApplied}
+        onSend={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => expect(onDraftApplied).toHaveBeenCalledWith("d1"));
+    expect(onDraftApplied).toHaveBeenCalledTimes(1);
+  });
+
+  it("sends the prefilled text only once the user presses Enter", async () => {
+    const onSend = vi.fn();
+    render(
+      <AcpComposer disabled={false} draft={{ id: "d1", text: "Summarise this" }} onSend={onSend} />,
+    );
+    await waitFor(() => expect(screen.getByRole("textbox")).toHaveValue("Summarise this"));
+
+    expect(onSend).not.toHaveBeenCalled();
+    await userEvent.keyboard("{Enter}");
+    expect(onSend).toHaveBeenCalledWith("Summarise this", undefined);
+  });
+});
+
+describe("mergeDraft", () => {
+  it("replaces an empty or whitespace-only draft outright", () => {
+    expect(mergeDraft("", "next")).toBe("next");
+    expect(mergeDraft("   \n ", "next")).toBe("next");
+  });
+
+  it("keeps typed text and adds the prompt on its own line", () => {
+    expect(mergeDraft("typed", "next")).toBe("typed\nnext");
+  });
+
+  it("does not stack blank lines when the draft already ends in one", () => {
+    expect(mergeDraft("typed\n\n", "next")).toBe("typed\nnext");
+  });
+});
+
+describe("staging a document", () => {
+  it("shows a document's filename, which a thumbnail-only chip could not", async () => {
+    render(<AcpComposer disabled={false} onSend={vi.fn()} />);
+    const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+    await userEvent.upload(fileInput, fakeFile("q3-report.pdf", "application/pdf"));
+
+    // The whole reason documents render through the `inline` variant: two
+    // attached PDFs must be tellable apart before sending.
+    expect(await screen.findByText("q3-report.pdf")).toBeInTheDocument();
+  });
+
+  it("delivers a document to onSend as a file attachment", async () => {
+    const onSend = vi.fn();
+    render(<AcpComposer disabled={false} onSend={onSend} />);
+    const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+    await userEvent.upload(fileInput, fakeFile("notes.md", "text/markdown"));
+    await userEvent.click(submitButton());
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
+    const [, attachments] = onSend.mock.calls[0];
+    expect(attachments).toHaveLength(1);
+    expect(attachments[0]).toMatchObject({ kind: "file", filename: "notes.md" });
+  });
+
+  it("refuses a file over the size cap and says so, instead of failing at send", async () => {
+    render(<AcpComposer disabled={false} maxFileSize={10} onSend={vi.fn()} />);
+    const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+    await userEvent.upload(fileInput, fakeFile("big.pdf", "application/pdf", "way-past-ten-bytes"));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/too large/i);
+  });
+});
+
+describe("host translations", () => {
+  const labels = {
+    attachFile: "ファイルを添付",
+    removeAttachment: "添付を削除",
+    submitPrompt: "送信",
+    stopPrompt: "停止",
+    fileTooLarge: (limit: number) => `サイズ上限 ${limit} MB`,
+    tooManyFiles: (count: number) => `最大 ${count} ファイル`,
+    attachmentFailed: "添付に失敗しました",
+  };
+
+  it("names the attach, remove, submit, and stop controls in the host language", async () => {
+    const { rerender } = render(<AcpComposer disabled={false} labels={labels} onSend={vi.fn()} />);
+    expect(screen.getByRole("button", { name: labels.attachFile })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: labels.submitPrompt })).toBeInTheDocument();
+
+    const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+    await userEvent.upload(fileInput, fakeFile("notes.md", "text/markdown"));
+    expect(screen.getByRole("button", { name: labels.removeAttachment })).toBeInTheDocument();
+
+    rerender(<AcpComposer disabled labels={labels} onSend={vi.fn()} onStop={vi.fn()} sending />);
+    expect(screen.getByRole("button", { name: labels.stopPrompt })).toBeInTheDocument();
+  });
+
+  it("uses the host language for attachment validation", async () => {
+    render(<AcpComposer disabled={false} labels={labels} maxFileSize={10} onSend={vi.fn()} />);
+    const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+    await userEvent.upload(fileInput, fakeFile("big.pdf", "application/pdf", "way-past-ten-bytes"));
+    expect(await screen.findByRole("alert")).toHaveTextContent("サイズ上限 0 MB");
+  });
+});
+
+describe("the file picker itself", () => {
+  // Regression: `maxFiles` defaulted to 10 while the hidden input had no
+  // `multiple` attribute, so the paperclip button accepted exactly one file.
+  // Only a real browser surfaces this — jsdom uploads whatever you hand it.
+  it("lets the picker select more than one file when maxFiles allows it", () => {
+    render(<AcpComposer disabled={false} onSend={vi.fn()} />);
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+    expect(input.multiple).toBe(true);
+  });
+
+  it("keeps the picker single-file when the host caps attachments at one", () => {
+    render(<AcpComposer disabled={false} maxFiles={1} onSend={vi.fn()} />);
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+    expect(input.multiple).toBe(false);
+  });
+});
+
+// Busabase's per-session model picker (and any future host control) mounts
+// here rather than as a separate row, so it lives in the same footer/tools
+// area as the attach button — see AcpComposerProps.footerControls.
+describe("footerControls", () => {
+  it("renders nothing extra in the footer by default", () => {
+    render(<AcpComposer disabled={false} onSend={vi.fn()} />);
+    expect(screen.queryByTestId("host-control")).not.toBeInTheDocument();
+  });
+
+  it("renders a host-provided control in the footer, alongside the attach button", () => {
+    render(
+      <AcpComposer
+        disabled={false}
+        footerControls={
+          <button data-testid="host-control" type="button">
+            Model: Auto
+          </button>
+        }
+        onSend={vi.fn()}
+      />,
+    );
+    const control = screen.getByTestId("host-control");
+    expect(control).toBeInTheDocument();
+    // Same immediate parent as the attach button — i.e. the shared
+    // PromptInputTools group, not a second row floated elsewhere in the
+    // footer's justify-between layout.
+    expect(control.parentElement).toBe(attachButton().parentElement);
+  });
+});
+
+// Busabase's removable node-context chip mounts here, above the textarea but
+// inside the same bordered surface — see AcpComposerProps.headerControls.
+describe("headerControls", () => {
+  it("renders no header row by default", () => {
+    render(<AcpComposer disabled={false} onSend={vi.fn()} />);
+    expect(screen.queryByTestId("host-header")).not.toBeInTheDocument();
+    // The empty-header guard has to live in AcpComposer itself: kui's
+    // InputGroupAddon (what PromptInputHeader renders) always emits a
+    // `[data-align]` group div regardless of children, so it can't no-op on
+    // its own. Only the footer's addon should exist when headerControls is
+    // omitted — a second one would mean an empty header row snuck in.
+    expect(document.querySelectorAll("[data-align]")).toHaveLength(1);
+  });
+
+  it("renders a host-provided control above the textarea", () => {
+    render(
+      <AcpComposer
+        disabled={false}
+        headerControls={<div data-testid="host-header">Context: doc.md</div>}
+        onSend={vi.fn()}
+      />,
+    );
+    const header = screen.getByTestId("host-header");
+    expect(header).toBeInTheDocument();
+    // DOM order: the header content precedes the textarea.
+    const box = screen.getByRole("textbox");
+    expect(header.compareDocumentPosition(box) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("coexists with footerControls — busabase uses both at once", () => {
+    render(
+      <AcpComposer
+        disabled={false}
+        footerControls={
+          <button data-testid="host-footer" type="button">
+            Model: Auto
+          </button>
+        }
+        headerControls={<div data-testid="host-header">Context: doc.md</div>}
+        onSend={vi.fn()}
+      />,
+    );
+    expect(screen.getByTestId("host-header")).toBeInTheDocument();
+    expect(screen.getByTestId("host-footer")).toBeInTheDocument();
+  });
+});
+
+describe("composer layout inside kui's InputGroup", () => {
+  // `PromptInputFooter` renders `data-align="block-end"`, which flips
+  // `InputGroup` to `flex-col` — and it is `items-center`, so a direct child
+  // without a width is centred rather than left-aligned. jsdom computes no
+  // layout, so the class is the only thing assertable here; the real-browser
+  // check that motivated it measured the strip floating in the middle of the
+  // composer instead of sitting flush above the textarea.
+  it("gives the staged-attachment strip a full width so it aligns with the textarea", async () => {
+    render(<AcpComposer disabled={false} onSend={vi.fn()} />);
+    const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+    await userEvent.upload(fileInput, fakeFile("notes.md", "text/markdown"));
+
+    // Walk up to the element that is a DIRECT child of the InputGroup — that
+    // is the one flex centring acts on. `closest(".w-full")` would be vacuous:
+    // the InputGroup itself carries `w-full`.
+    const group = document.querySelector('[data-slot="input-group"]') as HTMLElement;
+    let strip = (await screen.findByText("notes.md")) as HTMLElement;
+    while (strip.parentElement && strip.parentElement !== group) {
+      strip = strip.parentElement;
+    }
+    expect(strip.parentElement).toBe(group);
+    expect(strip.className).toContain("w-full");
+  });
+});

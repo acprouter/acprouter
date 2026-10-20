@@ -21,6 +21,7 @@ import {
   Plus,
   Users,
 } from "lucide-react";
+import { Fragment } from "react";
 import { AvatarLogo } from "../avatar-logo";
 import { useAccountSwitcherContext } from "./account-switcher-context";
 import type { NavUserLabels, SwitchableAccountView, UserData, UserMenuItem } from "./types";
@@ -121,7 +122,7 @@ export function NavUser({
             // raising `maximumSessions` would grow it without bound. Radix
             // measures the space left to the viewport edge for us; cap to that
             // and scroll, so the menu fits any screen at any account count.
-            className="flex max-h-[var(--radix-dropdown-menu-content-available-height)] w-[--radix-dropdown-menu-trigger-width] min-w-56 flex-col overflow-y-auto rounded-lg"
+            className="flex max-h-[var(--radix-dropdown-menu-content-available-height)] w-(--radix-dropdown-menu-trigger-width) min-w-56 flex-col overflow-y-auto rounded-lg"
             side={isMobile ? "bottom" : "right"}
             align="end"
             sideOffset={4}
@@ -213,37 +214,39 @@ export function NavUser({
               <>
                 <DropdownMenuSeparator />
                 <DropdownMenuGroup>
-                  {extraMenuItems.map((item) => {
+                  {extraMenuItems.map((item, index) => {
                     const shouldRenderLink = Boolean(item.href && !item.onClick);
+                    // The group already carries a separator above it, so a
+                    // leading item asking for one would draw a double rule.
+                    const opensSection = item.startsSection && index > 0;
 
                     return (
-                      <DropdownMenuItem
-                        key={item.href ?? item.label}
-                        asChild={shouldRenderLink}
-                        onClick={item.onClick}
-                      >
-                        {shouldRenderLink ? (
-                          <a
-                            href={item.href}
-                            target={item.external ? "_blank" : undefined}
-                            rel={item.external ? "noopener noreferrer" : undefined}
-                          >
-                            {item.icon && <item.icon className="size-4" />}
-                            {item.label}
-                            {item.external && (
-                              <ExternalLink className="ml-auto size-3 opacity-50" />
-                            )}
-                          </a>
-                        ) : (
-                          <>
-                            {item.icon && <item.icon className="size-4" />}
-                            {item.label}
-                            {item.external && (
-                              <ExternalLink className="ml-auto size-3 opacity-50" />
-                            )}
-                          </>
-                        )}
-                      </DropdownMenuItem>
+                      <Fragment key={item.href ?? item.label}>
+                        {opensSection && <DropdownMenuSeparator />}
+                        <DropdownMenuItem asChild={shouldRenderLink} onClick={item.onClick}>
+                          {shouldRenderLink ? (
+                            <a
+                              href={item.href}
+                              target={item.external ? "_blank" : undefined}
+                              rel={item.external ? "noopener noreferrer" : undefined}
+                            >
+                              {item.icon && <item.icon className="size-4" />}
+                              {item.label}
+                              {item.external && (
+                                <ExternalLink className="ml-auto size-3 opacity-50" />
+                              )}
+                            </a>
+                          ) : (
+                            <>
+                              {item.icon && <item.icon className="size-4" />}
+                              {item.label}
+                              {item.external && (
+                                <ExternalLink className="ml-auto size-3 opacity-50" />
+                              )}
+                            </>
+                          )}
+                        </DropdownMenuItem>
+                      </Fragment>
                     );
                   })}
                 </DropdownMenuGroup>

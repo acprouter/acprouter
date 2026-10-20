@@ -22,6 +22,9 @@ export const agentsRouter = os.router({
     connectRemoteAcp: os.agents.connectRemoteAcp.handler(({ context, input }) =>
       remoteAgentsLogic.connectRemoteAcpAgent(context.db, input),
     ),
+    remove: os.agents.remove.handler(({ context, input }) =>
+      agentsLogic.removeAgent(context.db, input.id),
+    ),
   },
   // Task #14 — mint/list/revoke the bearer credential external ACP
   // consumers present at `wss://<router>/api/acp?agentId=<id>`. Thin per this
@@ -59,6 +62,9 @@ export const agentsRouter = os.router({
     ),
     end: os.sessions.end.handler(({ context, input }) =>
       sessionsLogic.endAgentSession(context.db, input),
+    ),
+    cancelTurn: os.sessions.cancelTurn.handler(({ context, input }) =>
+      sessionsLogic.cancelAgentTurn(context.db, input),
     ),
     history: os.sessions.history.handler(({ context, input }) =>
       sessionEventsLogic.listSessionEvents(context.db, input.sessionId),

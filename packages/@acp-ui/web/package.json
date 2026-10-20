@@ -1,0 +1,80 @@
+{
+  "name": "@acp-ui/web",
+  "description": "Web binding layer for @acp-ui/core. Renders the ACP conversation view model with kui + kui/ai-elements components, and lets every block renderer be swapped out. Brings markdown rendering to ACP chat for the first time.",
+  "version": "0.0.1",
+  "license": "MIT",
+  "private": false,
+  "publishConfig": {
+    "access": "public",
+    "exports": {
+      "./transcript": {
+        "types": "./dist/transcript/index.d.ts",
+        "default": "./dist/transcript/index.js"
+      },
+      "./composer": {
+        "types": "./dist/composer/index.d.ts",
+        "default": "./dist/composer/index.js"
+      },
+      "./session-meta": {
+        "types": "./dist/session-meta/index.d.ts",
+        "default": "./dist/session-meta/index.js"
+      }
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mr-kelly/acp-ui.git",
+    "directory": "packages/@acp-ui/web"
+  },
+  "bugs": {
+    "url": "https://github.com/mr-kelly/acp-ui/issues"
+  },
+  "type": "module",
+  "scripts": {
+    "build": "tsdown",
+    "prepack": "pnpm run build",
+    "prepublishOnly": "pnpm run typecheck && pnpm run test && pnpm run lint:err && pnpm run build && node scripts/assert-pnpm-publish.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "lint": "biome format . --write && biome check . --write",
+    "lint:err": "biome format . --write && biome check . --write --diagnostic-level=error"
+  },
+  "exports": {
+    "./transcript": {
+      "types": "./src/transcript/index.ts",
+      "default": "./src/transcript/index.ts"
+    },
+    "./composer": {
+      "types": "./src/composer/index.ts",
+      "default": "./src/composer/index.ts"
+    },
+    "./session-meta": {
+      "types": "./src/session-meta/index.ts",
+      "default": "./src/session-meta/index.ts"
+    }
+  },
+  "dependencies": {
+    "@acp-ui/core": "workspace:*",
+    "lucide-react": "^1.34.0"
+  },
+  "peerDependencies": {
+    "kui": "workspace:*",
+    "react": "*"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.0",
+    "@testing-library/user-event": "^14.6.1",
+    "@types/node": "^26.3.0",
+    "@types/react": "19.2.17",
+    "jsdom": "^25.0.1",
+    "kui": "workspace:*",
+    "react": "^19.2.7",
+    "tsdown": "^0.22.14",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11"
+  }
+}

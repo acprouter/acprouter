@@ -35,9 +35,9 @@
  *   - ZH: 拼接所有语言值以便展示/调试（顺序不保证）。
  *
  * Fallback behavior (iStringParse) / 回退策略（iStringParse）
- * - EN: If str is a string, return it. If it is a record: prefer requested locale; else any non-"en"; else "en".
+ * - EN: If str is a string, return it. If it is a record: prefer requested locale; else "en"; else any available locale.
  *       Warn and return empty string if no suitable value exists.
- * - ZH: 若为纯字符串，原样返回；若为记录：优先使用请求的语言；否则使用任一非 "en"；再退回 "en"。
+ * - ZH: 若为纯字符串，原样返回；若为记录：优先使用请求的语言；否则使用 "en"；再退回任一可用语言。
  *       若均不可用，会发出警告并返回空字符串。
  *
  * Examples / 示例
@@ -112,8 +112,14 @@ export const iStringParse = (str: iString | undefined | null, lang: LocaleType =
   }
 
   const locales = Object.keys(str || {}) as LocaleType[];
-  const fallbackLocale =
-    locales.find((locale) => locale === lang) || locales.find((locale) => locale !== "en") || "en";
+  // Requested locale, then English, then whatever locale is available. English
+  // comes before "any other locale" so a missing translation shows English,
+  // not an arbitrary other language that happens to be listed first.
+  const fallbackLocale = locales.includes(lang)
+    ? lang
+    : locales.includes("en")
+      ? "en"
+      : (locales[0] ?? "en");
   const result = str[fallbackLocale as LocaleType];
 
   if (result === undefined) {

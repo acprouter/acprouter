@@ -1,7 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
-import type { IStorage, MultipartPart, StorageConfig, StorageObjectMetadata } from "./types";
+import type {
+  IStorage,
+  MultipartPart,
+  StorageConfig,
+  StorageObjectMetadata,
+  UploadPresignOptions,
+} from "./types";
 
 const mkdir = promisify(fs.mkdir);
 const writeFile = promisify(fs.writeFile);
@@ -102,6 +108,9 @@ export class LocalStorage implements IStorage {
     key: string,
     _mimeType: string,
     _expiresIn?: number,
+    // Nothing to sign on a local relay; callers verify the stored object after
+    // the upload instead (see `IStorage.generateUploadPresignedUrl`).
+    _options?: UploadPresignOptions,
   ): Promise<string> {
     // A root-relative URL: the client resolves it against the host it's already
     // talking to (ordinary URL resolution — no dev-specific knowledge) and PUTs
@@ -118,8 +127,19 @@ export class LocalStorage implements IStorage {
     try {
       await stat(filePath);
       return true;
-    } catch {
-      return false;
+    } catch (error) {
+      // A missing object is an ordinary false result. Permission and I/O
+      // errors are not evidence that the object is absent, so keep them visible
+      // to callers such as full-fidelity backup.
+      if (
+        typeof error === "object" &&
+        error !== null &&
+        "code" in error &&
+        error.code === "ENOENT"
+      ) {
+        return false;
+      }
+      throw error;
     }
   }
 

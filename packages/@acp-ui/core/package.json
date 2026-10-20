@@ -1,0 +1,87 @@
+{
+  "name": "@acp-ui/core",
+  "description": "Headless, renderer-free interaction core for ACP (Agent Client Protocol) agent chat. Reduces ACP session updates into a view model both live streaming and persisted-event replay can share. Renders nothing.",
+  "version": "0.0.1",
+  "license": "MIT",
+  "private": false,
+  "publishConfig": {
+    "access": "public",
+    "exports": {
+      "./reduce": {
+        "types": "./dist/reduce/index.d.ts",
+        "default": "./dist/reduce/index.js"
+      },
+      "./session": {
+        "types": "./dist/session/index.d.ts",
+        "default": "./dist/session/index.js"
+      },
+      "./group": {
+        "types": "./dist/group/index.d.ts",
+        "default": "./dist/group/index.js"
+      },
+      "./prompt": {
+        "types": "./dist/prompt/index.d.ts",
+        "default": "./dist/prompt/index.js"
+      }
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mr-kelly/acp-ui.git",
+    "directory": "packages/@acp-ui/core"
+  },
+  "bugs": {
+    "url": "https://github.com/mr-kelly/acp-ui/issues"
+  },
+  "type": "module",
+  "scripts": {
+    "build": "tsdown",
+    "prepack": "pnpm run build",
+    "prepublishOnly": "pnpm run typecheck && pnpm run test && pnpm run build && node scripts/assert-pnpm-publish.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "exports": {
+    "./reduce": {
+      "types": "./src/reduce/index.ts",
+      "default": "./src/reduce/index.ts"
+    },
+    "./session": {
+      "types": "./src/session/index.ts",
+      "default": "./src/session/index.ts"
+    },
+    "./group": {
+      "types": "./src/group/index.ts",
+      "default": "./src/group/index.ts"
+    },
+    "./prompt": {
+      "types": "./src/prompt/index.ts",
+      "default": "./src/prompt/index.ts"
+    }
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "1.3.0"
+  },
+  "peerDependencies": {
+    "react": "*"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@testing-library/react": "^16.3.0",
+    "@types/node": "^26.3.0",
+    "@types/react": "19.2.17",
+    "jsdom": "^25.0.1",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "tsdown": "^0.22.14",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11"
+  }
+}

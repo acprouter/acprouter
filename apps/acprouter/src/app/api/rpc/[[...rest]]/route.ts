@@ -9,6 +9,7 @@ import "server-only";
 import { agentsRouter, runWithLocalContext } from "@acprouter/core";
 import { RPCHandler } from "@orpc/server/fetch";
 import { getDb } from "~/db";
+import { resolveServerOrigin } from "~/lib/server-origin";
 
 const handler = new RPCHandler({ agents: agentsRouter });
 
@@ -23,7 +24,7 @@ async function handle(request: Request) {
 
 async function handleWithContext(request: Request) {
   const db = await getDb();
-  const serverOrigin = new URL(request.url).origin;
+  const serverOrigin = resolveServerOrigin(request.url);
 
   const result = await handler.handle(request, {
     context: { db, serverOrigin },

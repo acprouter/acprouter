@@ -1,7 +1,7 @@
 import { z } from "zod";
 export declare const i18n: {
   readonly defaultLocale: "en";
-  readonly locales: readonly ["en", "zh-CN", "zh-TW", "ja", "pt", "de"];
+  readonly locales: readonly ["en", "zh-CN", "zh-TW", "ja", "ko", "de", "fr", "es", "pt", "vi"];
   readonly extendLocales: readonly [
     "en",
     "zh-CN",
@@ -18,13 +18,18 @@ export declare const i18n: {
   ];
 };
 export type Locale = (typeof i18n)["locales"][number];
+export declare const LOCALE_NATIVE_NAMES: Record<Locale, string>;
 export type ExtendLocale = (typeof i18n)["extendLocales"][number];
 export declare const LocaleSchema: z.ZodEnum<{
+  de: "de";
   en: "en";
+  es: "es";
+  fr: "fr";
+  ja: "ja";
+  ko: "ko";
+  pt: "pt";
+  vi: "vi";
   "zh-CN": "zh-CN";
   "zh-TW": "zh-TW";
-  ja: "ja";
-  pt: "pt";
-  de: "de";
 }>;
 export type LocaleType = z.infer<typeof LocaleSchema>;

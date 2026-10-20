@@ -13,41 +13,73 @@
       "types": "./db/index.ts",
       "default": "./db/index.ts"
     },
+    "./db/replicas": {
+      "types": "./db/replicas.ts",
+      "default": "./db/replicas.ts"
+    },
     "./i18n": {
       "types": "./i18n/index.ts",
       "default": "./i18n/index.ts"
+    },
+    "./i18n/i18n": {
+      "types": "./i18n/i18n.ts",
+      "default": "./i18n/i18n.ts"
     },
     "./i18n/i-string": {
       "types": "./i18n/i-string.ts",
       "default": "./i18n/i-string.ts"
     },
-    "./nanoid": {
-      "types": "./nanoid/index.ts",
-      "default": "./nanoid/index.ts"
-    },
-    "./realtime": {
-      "types": "./realtime/index.ts",
-      "default": "./realtime/index.ts"
-    },
-    "./storage": {
-      "types": "./storage/index.ts",
-      "default": "./storage/index.ts"
+    "./i18n/lang-layout-client": {
+      "types": "./i18n/lang-layout-client.tsx",
+      "default": "./i18n/lang-layout-client.tsx"
     },
     "./mcp": {
       "types": "./mcp/index.ts",
       "default": "./mcp/index.ts"
     },
-    "./ui/dashboard": {
-      "types": "./ui/dashboard/index.ts",
-      "default": "./ui/dashboard/index.ts"
+    "./nanoid": {
+      "types": "./nanoid/index.ts",
+      "default": "./nanoid/index.ts"
     },
-    "./ui/dashboard/types": {
-      "types": "./ui/dashboard/types.ts",
-      "default": "./ui/dashboard/types.ts"
+    "./openapi": {
+      "types": "./openapi/index.ts",
+      "default": "./openapi/index.ts"
     },
-    "./ui/dashboard/demo": {
-      "types": "./ui/dashboard/demo.ts",
-      "default": "./ui/dashboard/demo.ts"
+    "./realtime": {
+      "types": "./realtime/index.ts",
+      "default": "./realtime/index.ts"
+    },
+    "./seo": {
+      "types": "./seo/index.ts",
+      "default": "./seo/index.ts"
+    },
+    "./seo/llms-routes": {
+      "types": "./seo/llms-routes.ts",
+      "default": "./seo/llms-routes.ts"
+    },
+    "./cache": {
+      "types": "./cache/index.ts",
+      "default": "./cache/index.ts"
+    },
+    "./cache/types": {
+      "types": "./cache/types.ts",
+      "default": "./cache/types.ts"
+    },
+    "./auth/better-auth-rate-limit": {
+      "types": "./auth/better-auth-rate-limit.ts",
+      "default": "./auth/better-auth-rate-limit.ts"
+    },
+    "./storage": {
+      "types": "./storage/index.ts",
+      "default": "./storage/index.ts"
+    },
+    "./storage/dev-routes": {
+      "types": "./storage/dev-routes.ts",
+      "default": "./storage/dev-routes.ts"
+    },
+    "./storage/types": {
+      "types": "./storage/types.ts",
+      "default": "./storage/types.ts"
     },
     "./ui/LanguageSwitcher": {
       "types": "./ui/LanguageSwitcher.tsx",
@@ -61,23 +93,37 @@
       "types": "./ui/avatar-upload.tsx",
       "default": "./ui/avatar-upload.tsx"
     },
+    "./ui/dashboard": {
+      "types": "./ui/dashboard/index.ts",
+      "default": "./ui/dashboard/index.ts"
+    },
+    "./ui/dashboard/demo": {
+      "types": "./ui/dashboard/demo.ts",
+      "default": "./ui/dashboard/demo.ts"
+    },
+    "./ui/dashboard/types": {
+      "types": "./ui/dashboard/types.ts",
+      "default": "./ui/dashboard/types.ts"
+    },
+    "./ui/dashboard/tree-drop": {
+      "types": "./ui/dashboard/tree-drop.ts",
+      "default": "./ui/dashboard/tree-drop.ts"
+    },
+    "./ui/nprogress": {
+      "types": "./ui/nprogress/index.ts",
+      "default": "./ui/nprogress/index.ts"
+    },
     "./utils/time": {
       "types": "./utils/time.ts",
       "default": "./utils/time.ts"
-    },
-    "./storage/types": {
-      "types": "./storage/types.ts",
-      "default": "./storage/types.ts"
-    },
-    "./storage/dev-routes": {
-      "types": "./storage/dev-routes.ts",
-      "default": "./storage/dev-routes.ts"
     }
   },
   "sideEffects": [
     "**/*.css"
   ],
   "scripts": {
+    "test": "vitest run",
+    "test:postgres-replicas": "vitest run db/replicas.postgres.integration.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "keywords": [],
@@ -90,24 +136,29 @@
     "@dnd-kit/utilities": "^3.2.2",
     "@formatjs/intl-localematcher": "0.6.2",
     "@modelcontextprotocol/sdk": "1.26.0",
-    "@next/third-parties": "^16.2.6",
+    "@next/third-parties": "^16.3.2",
     "@orpc/contract": "^1.14.6",
     "@orpc/openapi": "^1.14.6",
     "@orpc/server": "^1.14.6",
     "@orpc/zod": "^1.14.6",
     "dayjs": "1.11.10",
     "drizzle-orm": "^0.45.1",
+    "fumadocs-core": "16.14.5",
+    "fumadocs-ui": "16.14.5",
     "kui": "workspace:*",
+    "lmdb": "^3.5.1",
     "mime-types": "^2.1.35",
     "nanoid": "^5.1.5",
     "negotiator": "^0.6.3",
     "nprogress": "^0.2.0",
+    "postgres": "^3.4.6",
     "react-easy-crop": "^5.5.6",
     "redis": "^5.10.0",
+    "server-only": "^0.0.1",
     "zod": "^4.3.6"
   },
   "peerDependencies": {
-    "lucide-react": ">=0.556.0",
+    "lucide-react": "^1.34.0",
     "next": ">=14.0.0",
     "next-themes": ">=0.4.0",
     "react": "^19.2.4",
@@ -115,6 +166,7 @@
     "wouter": "^3.9.0"
   },
   "devDependencies": {
-    "@types/negotiator": "^0.6.4"
+    "@types/negotiator": "^0.6.4",
+    "@types/nprogress": "^0.2.3"
   }
 }

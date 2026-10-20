@@ -212,6 +212,54 @@ describe("createBridgeAgentApp", () => {
     }
   });
 
+  it("forwards the SPAWNED agent's promptCapabilities on session/new, which initialize cannot carry", async () => {
+    // The Router has no other way to learn them. This bridge does not spawn
+    // anything until `session/new`, so its own `initialize` answers for the
+    // CLI, not for the agent — asserted here as well, so a future change that
+    // "helpfully" reports the agent's capabilities on the handshake instead
+    // is caught rather than silently changing which one the Router trusts.
+    dir = mkdtempSync(join(tmpdir(), "acprouter-bridge-agent-test-"));
+    const bridge = createBridgeAgentApp({
+      dir,
+      registrySlug: FAKE_SLUG,
+      resolveDistribution: fakeResolveDistribution,
+    });
+
+    let routerConnection: acp.ClientConnection | undefined;
+    const routerClientApp = acp
+      .client({ name: "router-test-prompt-caps" })
+      .onConnect((connection) => {
+        routerConnection = connection;
+      });
+    const outerConnection = bridge.app.connect(routerClientApp);
+    const router = routerConnection as acp.ClientConnection;
+
+    try {
+      const initializeResult = await router.agent.request(acp.methods.agent.initialize, {
+        protocolVersion: acp.PROTOCOL_VERSION,
+        clientCapabilities: {},
+      });
+      expect(initializeResult.agentCapabilities?.promptCapabilities).toBeUndefined();
+
+      const session = await router.agent.request(acp.methods.agent.session.new, {
+        cwd: dir,
+        mcpServers: [],
+        _meta: { registrySlug: FAKE_SLUG },
+      });
+
+      // Exactly what the real child process advertised — `audio` absent, not
+      // defaulted to false, so the Router can tell "not supported" from
+      // "never mentioned".
+      expect((session._meta as { promptCapabilities?: unknown }).promptCapabilities).toEqual({
+        image: true,
+        embeddedContext: true,
+      });
+    } finally {
+      outerConnection.close();
+      router.close();
+    }
+  });
+
   it("task #10: a bridge with no configured registrySlug/authStatus (the pre-task-10 shape) reports an all-null _meta, not a crash", async () => {
     dir = mkdtempSync(join(tmpdir(), "acprouter-bridge-agent-test-"));
 

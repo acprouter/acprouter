@@ -2,8 +2,10 @@ import { rmSync } from "node:fs";
 import path from "node:path";
 import * as acp from "@agentclientprotocol/sdk";
 import { AcpServer } from "@agentclientprotocol/sdk/experimental/server";
+import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { WebSocket, WebSocketServer } from "ws";
+import { runWithMemberContext } from "../../../context";
 import { type Database, getDb } from "../../../db";
 import {
   acprouterAgentSessionEvents,
@@ -108,7 +110,7 @@ describe("createConsumerAcpAgentApp / resolveConsumerAcpAuth", () => {
   }
 
   /** A real ACP AGENT app standing in for a bridged machine's CLI — implements enough of `session/new`/`session/prompt` (including a mid-turn permission round trip) to drive this test end to end. */
-  function buildFakeBridgedMachine(): acp.AgentApp {
+  function buildFakeBridgedMachine(sessionId: string): acp.AgentApp {
     return acp
       .agent({ name: "fake-cli" })
       .onRequest(acp.methods.agent.initialize, () => ({
@@ -123,7 +125,10 @@ describe("createConsumerAcpAgentApp / resolveConsumerAcpAuth", () => {
           authDetail: null,
         },
       }))
-      .onRequest(acp.methods.agent.session.new, () => ({ sessionId: "sess_consumer_e2e_1" }))
+      .onRequest(acp.methods.agent.session.new, () => ({ sessionId }))
+      .onNotification(acp.methods.agent.session.cancel, (ctx) => {
+        machineCancellations.push(ctx.params.sessionId);
+      })
       .onRequest(acp.methods.agent.session.prompt, async (ctx) => {
         const outcome = await ctx.client.request(acp.methods.client.session.requestPermission, {
           sessionId: ctx.params.sessionId,
@@ -148,30 +153,128 @@ describe("createConsumerAcpAgentApp / resolveConsumerAcpAuth", () => {
   }
 
   let machinePermissionOutcomes: acp.RequestPermissionResponse[] = [];
+  let machineCancellations: string[] = [];
 
-  async function connectFakeBridgedMachine(): Promise<string> {
-    const minted = await mintEnrollmentToken(db, {}, "http://example.test");
-    const redeemed = await redeemEnrollmentToken(db, {
-      token: minted.token,
-      label: "test-machine",
-    });
+  async function connectFakeBridgedMachine(
+    ownerId = "local",
+    sessionId = "sess_consumer_e2e_1",
+  ): Promise<string> {
+    return runWithMemberContext({ db, ownerId }, async () => {
+      const minted = await mintEnrollmentToken(db, {}, "http://example.test");
+      const redeemed = await redeemEnrollmentToken(db, {
+        token: minted.token,
+        label: "test-machine",
+      });
 
-    const cliSocket = new WebSocket(`ws://127.0.0.1:${bridgePort}?machineId=${redeemed.machineId}`);
-    const agentApp = buildFakeBridgedMachine();
-    await new Promise<acp.AgentConnection>((resolve, reject) => {
-      cliSocket.once("open", () => resolve(agentApp.connect(streamFromWebSocket(cliSocket))));
-      cliSocket.once("error", reject);
-    });
+      const cliSocket = new WebSocket(
+        `ws://127.0.0.1:${bridgePort}?machineId=${redeemed.machineId}`,
+      );
+      const agentApp = buildFakeBridgedMachine(sessionId);
+      await new Promise<acp.AgentConnection>((resolve, reject) => {
+        cliSocket.once("open", () => resolve(agentApp.connect(streamFromWebSocket(cliSocket))));
+        cliSocket.once("error", reject);
+      });
 
-    await waitFor(async () => {
+      await waitFor(async () => {
+        const agents = await listAgents(db);
+        return agents.some((a) => a.machineId === redeemed.machineId);
+      });
       const agents = await listAgents(db);
-      return agents.some((a) => a.machineId === redeemed.machineId);
+      const agent = agents.find((a) => a.machineId === redeemed.machineId);
+      if (!agent) throw new Error("fake bridged agent never reported in");
+      return agent.id;
     });
-    const agents = await listAgents(db);
-    const agent = agents.find((a) => a.machineId === redeemed.machineId);
-    if (!agent) throw new Error("fake bridged agent never reported in");
-    return agent.id;
   }
+
+  async function connectConsumer(agentId: string, rawKey: string) {
+    const socket = new WebSocket(`ws://127.0.0.1:${consumerPort}?agentId=${agentId}`, {
+      headers: { authorization: `Bearer ${rawKey}` },
+    });
+    const stream = await new Promise<ReturnType<typeof streamFromWebSocket>>((resolve, reject) => {
+      socket.once("open", () => resolve(streamFromWebSocket(socket)));
+      socket.once("error", reject);
+    });
+    return { client: acp.client({ name: "tenant-test-consumer" }).connect(stream), socket };
+  }
+
+  it.each(["tenant-a", "tenant-b"])(
+    "rejects a valid key used with another agent belonging to %s",
+    async (otherOwner) => {
+      const agentId = await connectFakeBridgedMachine("tenant-a");
+      const otherAgentId = await connectFakeBridgedMachine(otherOwner);
+      const minted = await runWithMemberContext({ db, ownerId: "tenant-a" }, () =>
+        mintConsumerApiKey(db, agentId, "agent-a key", "http://127.0.0.1:15420"),
+      );
+      const { client, socket } = await connectConsumer(otherAgentId, minted.rawKey);
+      await expect(
+        client.agent.request(acp.methods.agent.initialize, {
+          protocolVersion: acp.PROTOCOL_VERSION,
+          clientCapabilities: {},
+        }),
+      ).rejects.toBeTruthy();
+      client.close();
+      socket.close();
+    },
+  );
+
+  it.each(["tenant-a", "tenant-b"])(
+    "isolates concurrent sessions and rejects foreign prompt/cancel for owner %s",
+    async (otherOwner) => {
+      machineCancellations = [];
+      const agentA = await connectFakeBridgedMachine("tenant-a", "session-a");
+      const agentB = await connectFakeBridgedMachine(otherOwner, "session-b");
+      const mintedA = await runWithMemberContext({ db, ownerId: "tenant-a" }, () =>
+        mintConsumerApiKey(db, agentA, "agent-a key", "http://127.0.0.1:15420"),
+      );
+      const mintedB = await runWithMemberContext({ db, ownerId: otherOwner }, () =>
+        mintConsumerApiKey(db, agentB, "agent-b key", "http://127.0.0.1:15420"),
+      );
+      const a = await connectConsumer(agentA, mintedA.rawKey);
+      const b = await connectConsumer(agentB, mintedB.rawKey);
+      await Promise.all(
+        [a.client, b.client].map((client) =>
+          client.agent.request(acp.methods.agent.initialize, {
+            protocolVersion: acp.PROTOCOL_VERSION,
+            clientCapabilities: {},
+          }),
+        ),
+      );
+      const created = await Promise.all(
+        [a.client, b.client].map((client) =>
+          client.agent.request(acp.methods.agent.session.new, { cwd: "/", mcpServers: [] }),
+        ),
+      );
+      expect(created.map((result) => result.sessionId)).toEqual(["session-a", "session-b"]);
+      await expect(
+        a.client.agent.request(acp.methods.agent.session.prompt, {
+          sessionId: "session-b",
+          prompt: [{ type: "text", text: "must not reach agent B" }],
+        }),
+      ).rejects.toBeTruthy();
+      await a.client.agent.notify(acp.methods.agent.session.cancel, { sessionId: "session-b" });
+      // Drain the async notification's ownership lookup before checking effects.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const [foreignSession] = await db
+        .select()
+        .from(acprouterAgentSessions)
+        .where(eq(acprouterAgentSessions.id, "session-b"));
+      expect(foreignSession.status).toBe("active");
+      expect(machineCancellations).toEqual([]);
+      await b.client.agent.notify(acp.methods.agent.session.cancel, { sessionId: "session-b" });
+      await waitFor(async () => {
+        const [row] = await db
+          .select()
+          .from(acprouterAgentSessions)
+          .where(eq(acprouterAgentSessions.id, "session-b"));
+        return row.status === "ended";
+      });
+      expect(machineCancellations).toEqual(["session-b"]);
+      for (const { client, socket } of [a, b]) {
+        client.close();
+        socket.close();
+      }
+    },
+  );
 
   it("rejects a wrong bearer credential at `initialize`, never at the upgrade itself", async () => {
     const agentId = await connectFakeBridgedMachine();
@@ -197,65 +300,72 @@ describe("createConsumerAcpAgentApp / resolveConsumerAcpAuth", () => {
     consumerSocket.close();
   });
 
-  it("a real minted key drives session/new -> session/prompt end to end, relaying session/update and a permission round trip to the CONSUMER's own ctx.client", async () => {
-    machinePermissionOutcomes = [];
-    const agentId = await connectFakeBridgedMachine();
-    const minted = await mintConsumerApiKey(db, agentId, "test key", "http://127.0.0.1:15420");
-    expect(minted.connectionUrl).toBe(`ws://127.0.0.1:15420/api/acp?agentId=${agentId}`);
+  it.each(["local", "hosted-tenant"])(
+    "a real minted key drives session/new -> session/prompt and permissions for owner %s",
+    async (ownerId) => {
+      machinePermissionOutcomes = [];
+      const agentId = await connectFakeBridgedMachine(ownerId);
+      const minted = await runWithMemberContext({ db, ownerId }, () =>
+        mintConsumerApiKey(db, agentId, "test key", "http://127.0.0.1:15420"),
+      );
+      expect(minted.connectionUrl).toBe(`ws://127.0.0.1:15420/api/acp?agentId=${agentId}`);
 
-    const consumerSocket = new WebSocket(`ws://127.0.0.1:${consumerPort}?agentId=${agentId}`, {
-      headers: { authorization: `Bearer ${minted.rawKey}` },
-    });
-    const stream = await new Promise<ReturnType<typeof streamFromWebSocket>>((resolve, reject) => {
-      consumerSocket.once("open", () => resolve(streamFromWebSocket(consumerSocket)));
-      consumerSocket.once("error", reject);
-    });
+      const consumerSocket = new WebSocket(`ws://127.0.0.1:${consumerPort}?agentId=${agentId}`, {
+        headers: { authorization: `Bearer ${minted.rawKey}` },
+      });
+      const stream = await new Promise<ReturnType<typeof streamFromWebSocket>>(
+        (resolve, reject) => {
+          consumerSocket.once("open", () => resolve(streamFromWebSocket(consumerSocket)));
+          consumerSocket.once("error", reject);
+        },
+      );
 
-    const receivedUpdates: acp.SessionNotification[] = [];
-    const client = acp
-      .client({ name: "test-consumer" })
-      .onNotification(acp.methods.client.session.update, (ctx) => {
-        receivedUpdates.push(ctx.params);
-      })
-      .onRequest(acp.methods.client.session.requestPermission, () => ({
-        outcome: { outcome: "selected", optionId: "allow" },
-      }))
-      .connect(stream);
+      const receivedUpdates: acp.SessionNotification[] = [];
+      const client = acp
+        .client({ name: "test-consumer" })
+        .onNotification(acp.methods.client.session.update, (ctx) => {
+          receivedUpdates.push(ctx.params);
+        })
+        .onRequest(acp.methods.client.session.requestPermission, () => ({
+          outcome: { outcome: "selected", optionId: "allow" },
+        }))
+        .connect(stream);
 
-    const initResult = await client.agent.request(acp.methods.agent.initialize, {
-      protocolVersion: acp.PROTOCOL_VERSION,
-      clientCapabilities: {},
-    });
-    expect(initResult.agentCapabilities?.loadSession).toBe(false);
+      const initResult = await client.agent.request(acp.methods.agent.initialize, {
+        protocolVersion: acp.PROTOCOL_VERSION,
+        clientCapabilities: {},
+      });
+      expect(initResult.agentCapabilities?.loadSession).toBe(false);
 
-    const { sessionId } = await client.agent.request(acp.methods.agent.session.new, {
-      cwd: "/",
-      mcpServers: [],
-    });
-    expect(sessionId).toBe("sess_consumer_e2e_1");
+      const { sessionId } = await client.agent.request(acp.methods.agent.session.new, {
+        cwd: "/",
+        mcpServers: [],
+      });
+      expect(sessionId).toBe("sess_consumer_e2e_1");
 
-    const promptResult = await client.agent.request(acp.methods.agent.session.prompt, {
-      sessionId,
-      prompt: [{ type: "text", text: "hi" }],
-    });
-    expect(promptResult.stopReason).toBe("end_turn");
-
-    // The consumer's OWN ctx.client received the real session/update — not
-    // the dashboard's oRPC queue, which nothing in this test ever touches.
-    expect(receivedUpdates).toEqual([
-      {
+      const promptResult = await client.agent.request(acp.methods.agent.session.prompt, {
         sessionId,
-        update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "PONG" } },
-      },
-    ]);
-    // The permission answer the CONSUMER gave really reached the spawned
-    // agent (the fake bridged machine) — proving the round trip is real, not
-    // just "the consumer's own request resolved."
-    expect(machinePermissionOutcomes).toEqual([
-      { outcome: { outcome: "selected", optionId: "allow" } },
-    ]);
+        prompt: [{ type: "text", text: "hi" }],
+      });
+      expect(promptResult.stopReason).toBe("end_turn");
 
-    client.close();
-    consumerSocket.close();
-  });
+      // The consumer's OWN ctx.client received the real session/update — not
+      // the dashboard's oRPC queue, which nothing in this test ever touches.
+      expect(receivedUpdates).toEqual([
+        {
+          sessionId,
+          update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "PONG" } },
+        },
+      ]);
+      // The permission answer the CONSUMER gave really reached the spawned
+      // agent (the fake bridged machine) — proving the round trip is real, not
+      // just "the consumer's own request resolved."
+      expect(machinePermissionOutcomes).toEqual([
+        { outcome: { outcome: "selected", optionId: "allow" } },
+      ]);
+
+      client.close();
+      consumerSocket.close();
+    },
+  );
 });

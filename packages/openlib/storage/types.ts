@@ -14,6 +14,19 @@ export interface StorageObjectMetadata {
 }
 
 /**
+ * Extra request properties to bind into a presigned upload URL.
+ *
+ * Each one becomes part of the signature where the adapter supports it, so the
+ * client must send exactly that value (S3 rejects a mismatch with 403).
+ */
+export interface UploadPresignOptions {
+  /** Exact byte length the client must upload (`Content-Length`). */
+  contentLength?: number;
+  /** Exact `Content-Disposition` the client must send and the object keeps. */
+  contentDisposition?: string;
+}
+
+/**
  * Storage provider type
  */
 export type StorageProvider = "s3" | "minio" | "r2" | "local";
@@ -28,6 +41,19 @@ export interface StorageConfig {
   accessKeyId?: string;
   secretAccessKey?: string;
   endpoint?: string;
+  /**
+   * Endpoint the SERVER uses for its own S3 calls (bucket creation, CORS,
+   * upload/download/list/delete) — as opposed to `endpoint`, which is what
+   * gets embedded into presigned URLs handed to the browser. The two differ
+   * whenever the public host (needed for the browser to reach storage, and
+   * for the presigned signature to match what the browser will request) is
+   * not reachable from the server process itself — e.g. a Kubernetes pod
+   * where the public host is an external ingress hostname/port-forward that
+   * has no route back into the cluster. Falls back to `endpoint` when unset,
+   * which preserves every deployment where the two already coincide (local
+   * dev, or Compose's `extra_hosts: host-gateway` trick).
+   */
+  internalEndpoint?: string;
   bucketName: string; // Required for both (as root folder name for local)
   region?: string;
   forcePathStyle?: boolean;
@@ -84,8 +110,19 @@ export interface IStorage {
 
   /**
    * Generate presigned URL for uploading file (PUT)
+   *
+   * `options` is optional and additive: an adapter that can bind more of the
+   * request into the signature (S3) does so, one that cannot (local relay)
+   * ignores it. Callers must therefore still verify the stored object after the
+   * upload (`getObjectMetadata`) — the signature narrows what a client can send,
+   * it is not the check.
    */
-  generateUploadPresignedUrl(key: string, mimeType: string, expiresIn?: number): Promise<string>;
+  generateUploadPresignedUrl(
+    key: string,
+    mimeType: string,
+    expiresIn?: number,
+    options?: UploadPresignOptions,
+  ): Promise<string>;
 
   /**
    * Check if object exists

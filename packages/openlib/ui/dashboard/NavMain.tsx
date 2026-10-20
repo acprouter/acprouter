@@ -1,9 +1,16 @@
 "use client";
 
-import type { DragEndEvent, DragMoveEvent } from "@dnd-kit/core";
-import { closestCenter, DndContext, PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
-import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
-import { CSS } from "@dnd-kit/utilities";
+import type { CollisionDetection, DragEndEvent, DragStartEvent } from "@dnd-kit/core";
+import {
+  DndContext,
+  DragOverlay,
+  MeasuringStrategy,
+  PointerSensor,
+  useDraggable,
+  useDroppable,
+  useSensor,
+  useSensors,
+} from "@dnd-kit/core";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "kui/collapsible";
 import {
   DropdownMenu,
@@ -17,7 +24,6 @@ import {
   SidebarGroupAction,
   SidebarGroupLabel,
   SidebarMenu,
-  SidebarMenuAction,
   SidebarMenuBadge,
   SidebarMenuButton,
   SidebarMenuItem,
@@ -38,6 +44,8 @@ import {
   Fragment,
   memo,
   type ReactNode,
+  useCallback,
+  useEffect,
   useMemo,
   useRef,
   useState,
@@ -45,10 +53,12 @@ import {
 import { useLocation, useSearch } from "wouter";
 import { SidebarTaskList } from "./SidebarTaskList";
 import { mergeSearchIntoHref, SPALink } from "./SPALink";
-import type { NavGroup, NavItem, NavItemAction } from "./types";
+import { resolveTreeDrop, type TreeDropRow, type TreeDropTarget } from "./tree-drop";
+import type { NavGroup, NavItem, NavItemAction, NavMainLabels } from "./types";
 
-/** Drop position relative to the row the dragged item was released over. */
-export type NavDropPosition = "before" | "after" | "inside";
+export type { NavDropPosition } from "./tree-drop";
+
+import type { NavDropPosition } from "./tree-drop";
 
 export interface NavNodeDropParams {
   /** The `id` of the dragged NavItem/sub-item. */
@@ -59,35 +69,62 @@ export interface NavNodeDropParams {
 }
 
 /**
- * Wraps a sidebar row to make it draggable + a drop target via dnd-kit's
- * `useSortable`. Rendered as its own component (rather than calling the hook
- * inline inside a `.map()`) so the hook is called with a stable identity per
- * row, matching the rules of hooks.
+ * Wraps a sidebar row to make it BOTH a drag source and a drop target.
+ *
+ * Deliberately `useDraggable` + `useDroppable`, NOT `useSortable`: a sortable
+ * row belongs to a one-dimensional `SortableContext` whose strategy translates
+ * every row mid-drag to preview a flat-list reorder. On a tree that preview is
+ * meaningless (rows jump around) and actively harmful — the shifted rects fed
+ * the drop-position maths, so reordering two children inside a folder resolved
+ * against the folder's own header and moved the node out to the root. See
+ * `tree-drop.ts` for the measurements. Plain draggable/droppable rows never
+ * move, so their rects stay in the same coordinate space as the pointer.
+ *
+ * Rendered as its own component (rather than calling the hooks inline inside a
+ * `.map()`) so they are called with a stable identity per row, matching the
+ * rules of hooks.
  */
-type SortableHandle = ReturnType<typeof useSortable>;
-
 export interface NavRowDragProps {
-  setNodeRef: SortableHandle["setNodeRef"];
-  attributes: SortableHandle["attributes"];
-  listeners: SortableHandle["listeners"];
+  setNodeRef: (element: HTMLElement | null) => void;
+  attributes: ReturnType<typeof useDraggable>["attributes"];
+  listeners: ReturnType<typeof useDraggable>["listeners"];
   style: CSSProperties;
 }
 
-function DraggableRow({ id, render }: { id: string; render: (p: NavRowDragProps) => ReactNode }) {
-  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
-    id,
-  });
+function DraggableRow({
+  id,
+  depth,
+  isContainer,
+  render,
+}: {
+  id: string;
+  depth: number;
+  isContainer: boolean;
+  render: (p: NavRowDragProps) => ReactNode;
+}) {
+  const { attributes, listeners, setNodeRef: setDragRef, isDragging } = useDraggable({ id });
+  // `depth`/`isContainer` ride along on the droppable so collision detection can
+  // read them straight off the container it is already iterating, instead of
+  // closing over a separate lookup table that could drift out of sync.
+  const { setNodeRef: setDropRef } = useDroppable({ id, data: { depth, isContainer } });
+  // One DOM node, two dnd-kit registrations — the row is its own drop target.
+  const setNodeRef = useCallback(
+    (element: HTMLElement | null) => {
+      setDragRef(element);
+      setDropRef(element);
+    },
+    [setDragRef, setDropRef],
+  );
   return (
     <>
       {render({
         setNodeRef,
         attributes,
         listeners,
-        style: {
-          transform: CSS.Transform.toString(transform),
-          transition,
-          opacity: isDragging ? 0.4 : 1,
-        },
+        // No transform/transition: the row stays exactly where it is for the
+        // whole drag. The only feedback is this dimming plus the drop indicator
+        // drawn on the target row (and the DragOverlay following the cursor).
+        style: { opacity: isDragging ? 0.4 : 1 },
       })}
     </>
   );
@@ -107,8 +144,77 @@ const getNavItemKey = (item: NavKeyItem, index: number, prefix = "item") =>
 
 const isExternalUrl = (url: string) => url.startsWith("http://") || url.startsWith("https://");
 
+/**
+ * Renders nothing; asks the consumer to load `item`'s children exactly once
+ * per mount. Rendered only inside an OPEN folder that declares `hasChildren`
+ * but has no loaded `items` yet, so mounting IS the "this folder is showing
+ * and has nothing to show" signal.
+ *
+ * Why this and not the `Collapsible`'s own `onOpenChange`: a folder also opens
+ * with no toggle event at all. `isOpen` is true whenever the folder — or any
+ * descendant — is the active route, so merely NAVIGATING to a folder expands
+ * it. Radix only fires `onOpenChange` for interactions with the trigger, so
+ * that route-driven open never reached `onExpand`, and any folder past the
+ * host's eager prefetch depth (whose children only ever arrive lazily) stayed
+ * permanently, silently empty in the sidebar while its own detail page listed
+ * the children just fine. Reacting to the rendered `isOpen` state instead of
+ * to one of the events that can produce it covers every route into it.
+ */
+function NavLazyExpandTrigger({
+  item,
+  onExpand,
+}: {
+  item: NavItem;
+  onExpand: (item: NavItem) => void;
+}) {
+  // Read through a ref so `item` — a fresh object on every parent render —
+  // stays out of the dependency list. One ask per mount is exactly right: the
+  // folder row this renders inside is keyed by the node's id, so a different
+  // folder is a different mount.
+  const itemRef = useRef(item);
+  itemRef.current = item;
+  useEffect(() => {
+    onExpand(itemRef.current);
+  }, [onExpand]);
+  return null;
+}
+
+/**
+ * The ONE button footprint for every hover-revealed row control, at every depth.
+ *
+ * `size-5` + a `size-4` icon deliberately matches kui's own `SidebarMenuAction`
+ * (`w-5`, `[&>svg]:size-4`) rather than inventing a fourth size: leaf rows across
+ * every app already render at those metrics, so folder rows converge onto the
+ * existing design-system standard instead of everything converging onto a new one.
+ */
+const NAV_ROW_ACTION_BUTTON =
+  "flex size-5 shrink-0 items-center justify-center rounded-md p-0 outline-none ring-sidebar-ring transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 [&>svg]:size-4 [&>svg]:shrink-0";
+
+/**
+ * Keeps the cluster visible while its "•••" dropdown is open — without this the
+ * menu closes the moment the pointer leaves the row to travel to the menu.
+ */
+const NAV_ROW_ACTIONS_OPEN_CLASS = "has-[[data-state=open]]:opacity-100";
+
+/**
+ * Trailing room a row's title must leave for its hover cluster, indexed by how
+ * many controls that row renders.
+ *
+ * Derived rather than guessed: the cluster sits at `right-1` (4px) and packs N
+ * `size-5` (20px) buttons with `gap-0.5` (2px), so it occupies 4 + 20N + 2(N−1)
+ * px — 24, 46, 68, 90 for N = 1..4. Each entry is the next Tailwind spacing step
+ * at or above that. Folder rows previously reserved a flat 96px for what is
+ * really 68px of controls, which is why long names ("Personal Knowledge")
+ * truncated on a 255px sidebar while ~28px of the row sat empty.
+ */
+const NAV_ROW_TRAILING_PADDING = ["pr-2", "pr-7", "pr-12", "pr-[4.5rem]", "pr-24"] as const;
+
+const navRowTrailingPadding = (actionCount: number) =>
+  NAV_ROW_TRAILING_PADDING[Math.min(actionCount, NAV_ROW_TRAILING_PADDING.length - 1)];
+
 interface NavMainProps {
   items: NavGroup[];
+  labels?: NavMainLabels;
   /**
    * Callback when a group's header action button is clicked
    * @param groupLabel - The label of the group whose action was clicked
@@ -147,18 +253,44 @@ interface NavMainProps {
    */
   isDropAllowed?: (draggedId: string, targetId: string, position: NavDropPosition) => boolean;
   /**
-   * Called when a folder row (`item.hasChildren` or `item.items`) transitions
-   * to open while it has no loaded `items` yet (`item.hasChildren: true` but
-   * `items` empty/undefined) — the signal for a consumer that lazy-loads a
-   * folder's children on first expand to kick off that fetch. Never called
-   * for a folder that already has `items` loaded, or on every open/close —
-   * only the "needs its children" transition.
+   * Called for a folder row that is rendered OPEN while it has no loaded
+   * `items` yet (`item.hasChildren: true`, `items` empty/undefined) — the
+   * signal for a consumer that lazy-loads a folder's children to kick off
+   * that fetch. Never called for a folder that already has `items` loaded.
+   *
+   * Deliberately tied to the rendered open STATE, not to a toggle event: a
+   * folder also opens by simply being (or containing) the active route, with
+   * no `onOpenChange` ever firing. Expect it once per such row per mount, so
+   * it must be idempotent — re-opening a folder whose children are already
+   * cached will call it again.
    */
   onExpand?: (item: NavItem) => void;
+  /**
+   * Ids of the folders on the path to the currently-active row — its ancestor
+   * chain, supplied by the consumer (which is the only side that can resolve
+   * it; see below). Any row whose `id` is in here is treated as being on the
+   * active path: it renders open, and if its children are not loaded yet the
+   * usual `onExpand` fetch fires for it.
+   *
+   * Needed because "am I an ancestor of the active row?" is otherwise answered
+   * by walking `items` — which only sees children ALREADY LOADED. For a tree
+   * that is lazily expanded, landing directly on a deep url (a refresh, a
+   * bookmark, a shared link) means none of the ancestors have been fetched, so
+   * that walk finds nothing, nothing expands, and nothing can ever expand:
+   * without an expansion there is no fetch, and without a fetch there is
+   * nothing to expand. This breaks the deadlock — each expanded ancestor loads
+   * the next level, which contains the next ancestor, and so on down to the
+   * active row.
+   *
+   * Omit for a consumer that loads its whole tree eagerly; the `items` walk
+   * already covers that case.
+   */
+  activeAncestorIds?: ReadonlySet<string>;
 }
 
 function NavMainComponent({
   items,
+  labels,
   onHeaderActionClick,
   onNavItemAction,
   isTaskListExpanded,
@@ -166,6 +298,7 @@ function NavMainComponent({
   onNodeDrop,
   isDropAllowed,
   onExpand,
+  activeAncestorIds,
 }: NavMainProps) {
   const [location, setLocation] = useLocation();
   const currentSearch = useSearch();
@@ -175,37 +308,186 @@ function NavMainComponent({
   const isPathActive = (url?: string) =>
     !!url && (location === url || (url !== "/" && location.startsWith(`${url}/`)));
   const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({});
-  // Per-folder manual expand/collapse override (by nav-item key). A folder on the
-  // active route is always expanded; this only adds extra opens for other folders.
-  const [openOverrides, setOpenOverrides] = useState<Record<string, boolean>>({});
-
-  // Drag-and-drop: dnd-kit needs a flat registry of every id that can act as a
-  // drag source or drop target (every row at every depth), plus whether each
-  // is a "folder" row (has `items`) so onDragOver can offer an "inside" drop
-  // band only for rows that can actually contain children. Walks the WHOLE
-  // recursive tree — a folder nested at any depth is a valid drag source and
-  // drop target, not just top-level folders.
-  const dragEnabled = Boolean(onNodeDrop);
-  const { sortableIds, folderIds } = useMemo(() => {
-    const ids: string[] = [];
-    const folders = new Set<string>();
-    const visit = (list: NavItem[]) => {
-      for (const item of list) {
-        if (item.id) ids.push(item.id);
-        // A `hasChildren`-only folder (not yet expanded/loaded) is still a
-        // valid "inside" drop target, same as one with `items` already loaded.
-        if (item.items || item.hasChildren) {
-          if (item.id) folders.add(item.id);
-          if (item.items) visit(item.items);
+  // Per-folder manual expand/collapse override, by nav-item key.
+  //
+  // A COLLAPSE carries the location it was made at and expires the moment
+  // location changes to anything else — see the pruning effect below, which
+  // is what actually enforces "anything else". Comparing the override's `at`
+  // against the CURRENT location on every render instead (no effect, no
+  // pruning) was tried first and breaks the instant you navigate away and
+  // back to the exact same path: collapse Brand Kit while on
+  // `/folder/brand-kit`, go Home, click back down through 2026 Launch ->
+  // Launch Assets -> Brand Kit — location is `/folder/brand-kit` again, so a
+  // plain string comparison cannot tell "never left" from "left and
+  // returned", and the stale collapse reappears hiding the very row you just
+  // navigated to.
+  //
+  // Existing at all is what makes the chevron work on the folder you are
+  // currently inside: that folder is pinned open by `isActiveTree`, so
+  // Radix's `onOpenChange(!open)` — `open` always `true` — sends `false` on
+  // every click, and nothing would move without an override to override it.
+  //
+  // An EXPAND has neither hazard, so it simply persists as you browse.
+  const [openOverrides, setOpenOverrides] = useState<Record<string, { open: boolean; at: string }>>(
+    {},
+  );
+  // Enforces "expires on navigation" for a collapse: fires on every location
+  // change and drops any override whose `at` is not THIS location, before the
+  // next render computes `isOpen`. An expand is untouched — it has no reason
+  // to expire.
+  useEffect(() => {
+    setOpenOverrides((prev) => {
+      let changed = false;
+      const next: typeof prev = {};
+      for (const [key, override] of Object.entries(prev)) {
+        if (override.open || override.at === location) {
+          next[key] = override;
+        } else {
+          changed = true;
         }
       }
+      return changed ? next : prev;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [location]);
+
+  // Scrolls the row whose OWN url exactly matches the current location into
+  // view. Exists because a depth-bounded, lazily-expanded tree can land the
+  // just-navigated-to row anywhere: past the visible fold entirely, or
+  // sitting behind a host's fixed sidebar footer (both look, to a user, like
+  // the row never loaded — it did, it's just off-screen).
+  //
+  // Reacts to actual DOM mutations inside the tree (by a `data-nav-url`
+  // attribute set on every row below), rather than a fixed-length poll or a
+  // mount-triggered ref — both were tried first, and both guess at a timing
+  // budget that real async loading doesn't respect:
+  //
+  // - A mount-triggered ref only fires for a row that GENUINELY mounts fresh.
+  //   That covers a cold deep-link (refresh, bookmark, shared link), whose row
+  //   only exists once `NavLazyExpandTrigger`'s ancestor-chain fetch resolves
+  //   — but not clicking DOWN through an already-expanded tree (Product Ops
+  //   -> 2026 Launch -> ... -> Brand Kit), which navigates onto a row that was
+  //   ALREADY in the DOM before the click (you have to see a row to click it,
+  //   so nothing mounts). No mount, so the ref never fires.
+  // - A fixed settle-then-check poll (wait N x 100ms, hope nothing moves
+  //   again after) covers that case, but Brand Kit's own further children
+  //   loading in — a SEPARATE lazy fetch, on a real network, with no fixed
+  //   upper bound — can keep shifting the row's position well past whatever
+  //   budget seemed "generous enough" in testing, silently reintroducing the
+  //   exact bug this is fixing.
+  //
+  // A MutationObserver has no such budget to guess: every time the tree's DOM
+  // actually changes, it re-runs the same visibility check, however many
+  // times that takes, however long the underlying fetches take. It stops
+  // after `CORRECTION_WINDOW_MS` of no further mutations (or that much time
+  // has elapsed since navigation) so it doesn't fight a user who has since
+  // scrolled elsewhere on their own.
+  const navContainerRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const CORRECTION_WINDOW_MS = 4000;
+    const deadline = Date.now() + CORRECTION_WINDOW_MS;
+    let debounceId: ReturnType<typeof setTimeout> | undefined;
+    let stopId: ReturnType<typeof setTimeout>;
+
+    const evaluate = () => {
+      const headerEl = navContainerRef.current?.querySelector<HTMLElement>(
+        `[data-nav-url="${CSS.escape(location)}"]`,
+      );
+      if (!headerEl) return;
+      // The `<li>` wrapping this row. For a leaf, `data-nav-url` already
+      // lives on the `<li>` itself, so this is a no-op. For a FOLDER,
+      // `data-nav-url` lives on its inner header `<div>` — the `<li>` also
+      // wraps its `CollapsibleContent`, i.e. every currently-visible child —
+      // and that's deliberately what gets checked and scrolled here, not just
+      // the header. A folder whose OWN header is already on-screen but whose
+      // children still land behind the footer is the exact scenario this fix
+      // exists for: the whole point of navigating into a folder is to see
+      // what's in it, so "the header made it, its contents didn't" is not
+      // success.
+      const el = headerEl.closest<HTMLElement>("li") ?? headerEl;
+      // Gate on ACTUAL occlusion, not merely "call scrollIntoView and let the
+      // browser decide" (`block: "nearest"` is a no-op when already visible,
+      // but landed a couple of pixels short of the true fold in this
+      // sidebar's doubly-nested scroll containers — a host's own wrapper
+      // around this tree, inside kui's own `SidebarContent`, each scrolling
+      // independently). A plain viewport-bounds check alone isn't enough
+      // either: a row sitting exactly in a fixed footer's band still reports
+      // a rect fully inside the window (the footer PAINTS OVER it, it isn't
+      // clipped out of the layout). So also check the footer's own band
+      // directly, if this host renders one (kui's `Sidebar` primitive, which
+      // this component is built to run inside) — `elementFromPoint` alone
+      // only samples ONE pixel, meaningless for a tall folder-plus-children
+      // box, where the header can be clear while a child two rows down is
+      // still covered.
+      const rect = el.getBoundingClientRect();
+      const footerRect = document.querySelector('[data-sidebar="footer"]')?.getBoundingClientRect();
+      const overlapsFooter =
+        !!footerRect && rect.bottom > footerRect.top && rect.top < footerRect.bottom;
+      const paintedAtHeaderCenter = document.elementFromPoint(
+        rect.left + rect.width / 2,
+        rect.top + headerEl.getBoundingClientRect().height / 2,
+      );
+      const alreadyVisible =
+        rect.top >= 0 &&
+        rect.bottom <= window.innerHeight &&
+        !overlapsFooter &&
+        !!paintedAtHeaderCenter &&
+        headerEl.contains(paintedAtHeaderCenter);
+      if (alreadyVisible) return;
+      // `block: "start"`, not `"center"`: a folder's children render BELOW
+      // its header, never above, so pinning the header near the top of the
+      // scrollport leaves the maximum possible room for them, where centering
+      // would waste half that room above the header where there is nothing to
+      // show. `"start"` clears the nested-container rounding shortfall
+      // `"nearest"` suffered from just as reliably — the fix for that was
+      // "give it real margin", and `"start"` gives just as much as `"center"`
+      // did.
+      el.scrollIntoView({ block: "start" });
     };
-    if (!dragEnabled) return { sortableIds: ids, folderIds: folders };
+
+    const observer = new MutationObserver(() => {
+      if (Date.now() > deadline) {
+        observer.disconnect();
+        return;
+      }
+      // Coalesce a burst of mutations (a folder's children arriving is
+      // several DOM insertions, not one) into a single re-check per burst.
+      clearTimeout(debounceId);
+      debounceId = setTimeout(evaluate, 50);
+    });
+    if (navContainerRef.current) {
+      observer.observe(navContainerRef.current, { childList: true, subtree: true });
+    }
+    evaluate(); // the "nothing more is going to change" case: no mutations, check once up front.
+    stopId = setTimeout(() => observer.disconnect(), CORRECTION_WINDOW_MS);
+
+    return () => {
+      observer.disconnect();
+      clearTimeout(debounceId);
+      clearTimeout(stopId);
+    };
+  }, [location]);
+
+  const dragEnabled = Boolean(onNodeDrop);
+  // Titles of every draggable row, for the `DragOverlay` chip that follows the
+  // cursor. Only groups that opted into drag are walked — see `NavGroup.draggable`
+  // for why a group must opt in rather than every non-dynamic group being swept
+  // in: Favorites renders the SAME node ids as the tree, and two DOM rows
+  // registering one dnd-kit id made the drop indicator light up on both at once.
+  const dragRowTitles = useMemo(() => {
+    const titles = new Map<string, string>();
+    if (!dragEnabled) return titles;
+    const visit = (list: NavItem[]) => {
+      for (const item of list) {
+        if (item.id) titles.set(item.id, item.title);
+        if (item.items) visit(item.items);
+      }
+    };
     for (const group of items) {
-      if (group.isDynamic) continue;
+      if (group.isDynamic || !group.draggable) continue;
       visit(group.items);
     }
-    return { sortableIds: ids, folderIds: folders };
+    return titles;
   }, [items, dragEnabled]);
 
   type DragState = {
@@ -215,81 +497,120 @@ function NavMainComponent({
     disallowed: boolean;
   } | null;
   const [dragState, setDragState] = useState<DragState>(null);
-  // Mirrors `dragState` synchronously (no re-render lag). `onDragMove` and
-  // `onDragEnd` can both fire from the same native pointer-up sequence before
-  // React commits the last `setDragState` from `onDragMove` — reading the
-  // `dragState` closure in `onDragEnd` in that case returns a STALE value
-  // (e.g. the previous tick's "before/after" instead of the "inside" the
-  // pointer had actually just reached), silently dropping into the wrong
-  // parent right when the user releases over a folder. The ref is always
-  // current the instant `onDragMove` runs, regardless of render timing.
+  // Mirrors `dragState` synchronously (no re-render lag). `onDragEnd` can fire
+  // from the same native pointer-up sequence before React commits the last
+  // `setDragState`, so reading the `dragState` closure there can return a STALE
+  // value. The ref is always current.
   const dragStateRef = useRef<DragState>(null);
   const setDrag = (next: DragState) => {
     dragStateRef.current = next;
     setDragState(next);
   };
+  // The drop resolved by `collisionDetection` below on the most recent pointer
+  // tick. Both the visual indicator and the committed move read THIS — which is
+  // what makes it structurally impossible for the two to disagree. They used to
+  // be computed separately (indicator from our own before/after maths, commit
+  // from dnd-kit's `over`), and mid-drag they genuinely diverged: the indicator
+  // line drew on the sibling row while the request that fired named the parent
+  // folder.
+  const resolvedDropRef = useRef<TreeDropTarget | null>(null);
 
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
 
-  // `onDragMove`, not `onDragOver` — dnd-kit only fires onDragOver when the
-  // collided droppable id CHANGES, so a before/after read taken there goes
-  // stale the instant the pointer keeps moving inside the same target's rect
-  // (exactly the common case: dragging slowly toward the top vs. bottom half
-  // of a row). onDragMove fires on every pointer tick with a fresh `over` too.
-  const handleDragMove = (event: DragMoveEvent) => {
-    const { active, over } = event;
-    if (!over) {
-      setDrag(
-        dragStateRef.current ? { ...dragStateRef.current, overId: null, position: null } : null,
+  /**
+   * Collision detection AND drop-position resolution in one pass, delegated to
+   * the pure `resolveTreeDrop` (see `tree-drop.ts`).
+   *
+   * Not `closestCenter`: nearest-center snaps the drop onto whatever row happens
+   * to be closest even when the pointer is nowhere near it, which on a tree
+   * means a parent folder header repeatedly winning over the sibling row the
+   * user is pointing at. This is strictly "the row the pointer is actually
+   * inside, deepest first" — outside every row resolves to no target at all.
+   */
+  const collisionDetection: CollisionDetection = useCallback(
+    ({ active, droppableContainers, droppableRects, pointerCoordinates }) => {
+      if (!pointerCoordinates) {
+        resolvedDropRef.current = null;
+        return [];
+      }
+      const activeId = String(active.id);
+      const rows: TreeDropRow[] = [];
+      for (const container of droppableContainers) {
+        const id = String(container.id);
+        // A row is never its own drop target.
+        if (id === activeId) continue;
+        const rect = droppableRects.get(container.id);
+        if (!rect) continue;
+        const data = container.data.current as
+          | { depth?: number; isContainer?: boolean }
+          | undefined;
+        rows.push({
+          id,
+          top: rect.top,
+          height: rect.height,
+          isContainer: Boolean(data?.isContainer),
+          depth: data?.depth ?? 0,
+        });
+      }
+      const resolved = resolveTreeDrop(rows, pointerCoordinates.y);
+      resolvedDropRef.current = resolved;
+      if (!resolved) return [];
+      const winner = droppableContainers.find(
+        (container) => String(container.id) === resolved.targetId,
       );
+      return winner ? [{ id: winner.id }] : [];
+    },
+    [],
+  );
+
+  // Fires on every pointer tick. It only mirrors what `collisionDetection`
+  // already resolved into React state so the indicator can render — all the
+  // geometry lives in the pure function, none of it here.
+  const handleDragMove = () => {
+    const previous = dragStateRef.current;
+    if (!previous) return;
+    const resolved = resolvedDropRef.current;
+    if (!resolved) {
+      if (previous.overId === null) return;
+      setDrag({ ...previous, overId: null, position: null, disallowed: false });
       return;
     }
-    const activeId = String(active.id);
-    const overId = String(over.id);
-    if (activeId === overId) {
-      setDrag({ activeId, overId: null, position: null, disallowed: false });
+    const disallowed = isDropAllowed
+      ? !isDropAllowed(previous.activeId, resolved.targetId, resolved.position)
+      : false;
+    if (
+      previous.overId === resolved.targetId &&
+      previous.position === resolved.position &&
+      previous.disallowed === disallowed
+    ) {
       return;
     }
-    const overRect = over.rect;
-    // NOT `active.rect.current.translated` — `verticalListSortingStrategy` already
-    // animates the dragged item's translated rect into a "swap preview" position as
-    // soon as `over` changes, which corrupts a before/after read taken from it (it
-    // reports a rect that has already visually jumped near/past the target, not
-    // where the pointer actually is). The `initial` rect + the event's own
-    // pointer delta gives the untransformed position, immune to that choreography.
-    const initialRect = active.rect.current.initial;
-    if (!overRect || !initialRect) {
-      setDrag({ activeId, overId, position: "after", disallowed: false });
-      return;
-    }
-    const activeCenterY = initialRect.top + initialRect.height / 2 + event.delta.y;
-    const relativeY = (activeCenterY - overRect.top) / overRect.height;
-    const overIsFolder = folderIds.has(overId);
-    let position: NavDropPosition;
-    if (overIsFolder && relativeY > 0.25 && relativeY < 0.75) {
-      position = "inside";
-    } else if (relativeY <= 0.5) {
-      position = "before";
-    } else {
-      position = "after";
-    }
-    const disallowed = isDropAllowed ? !isDropAllowed(activeId, overId, position) : false;
-    setDrag({ activeId, overId, position, disallowed });
+    setDrag({
+      activeId: previous.activeId,
+      overId: resolved.targetId,
+      position: resolved.position,
+      disallowed,
+    });
+  };
+
+  const handleDragStart = (event: DragStartEvent) => {
+    resolvedDropRef.current = null;
+    setDrag({ activeId: String(event.active.id), overId: null, position: null, disallowed: false });
   };
 
   const handleDragEnd = (event: DragEndEvent) => {
-    const { active, over } = event;
-    // Read the ref, NOT the `dragState` closure — see the comment on
-    // `dragStateRef` above for why the closure can be stale here.
-    const finalState = dragStateRef.current;
+    const resolved = resolvedDropRef.current;
+    resolvedDropRef.current = null;
     setDrag(null);
-    if (!over || !onNodeDrop) return;
-    const activeId = String(active.id);
-    const overId = String(over.id);
-    if (activeId === overId) return;
-    const position = finalState?.position ?? "after";
-    if (isDropAllowed && !isDropAllowed(activeId, overId, position)) return;
-    onNodeDrop({ draggedId: activeId, targetId: overId, position });
+    if (!onNodeDrop || !resolved) return;
+    const activeId = String(event.active.id);
+    if (activeId === resolved.targetId) return;
+    if (isDropAllowed && !isDropAllowed(activeId, resolved.targetId, resolved.position)) return;
+    onNodeDrop({
+      draggedId: activeId,
+      targetId: resolved.targetId,
+      position: resolved.position,
+    });
   };
 
   // Visual cue for the row currently under the drag pointer: an accent ring
@@ -355,6 +676,155 @@ function NavMainComponent({
       </Fragment>
     ));
 
+  /**
+   * Every hover-revealed row control — drag grip, "+", delete, "•••" — at every
+   * depth, in one place.
+   *
+   * These used to be three independent implementations (folder header, top-level
+   * leaf, nested leaf) that had drifted apart on every axis at once. Measured on
+   * a 255px sidebar: the "•••" button was 28px on a folder row and 20px on a
+   * Base row, its icon 14px vs 12px, its right edge landed at x=243 vs x=206,
+   * and the grip sat LEFTMOST on folder rows but RIGHTMOST on leaf rows — so the
+   * same two controls swapped places depending which row you hovered. The old
+   * `right-7`/`right-1` offsets also meant every new control needed another
+   * hand-computed offset in three files' worth of places.
+   *
+   * One flex cluster, one button size, one order (grip → add → delete → more,
+   * "more" always last), anchored `right-1` for every row type. Flex handles the
+   * spacing, so adding a control never needs another magic offset again.
+   */
+  /**
+   * A persistent state marker (see `NavItem.statusIcon`) — e.g. the globe on a
+   * publicly shared node. Shares the trailing slot with `renderRowActions` and
+   * fades out exactly as that cluster fades in, so an idle row shows state and
+   * a hovered row shows controls. `pointer-events-none` keeps it from swallowing
+   * the hover meant for the controls underneath.
+   *
+   * One implementation for all three row variants, which is only possible
+   * because they now share the `group/nav-row` hover group.
+   */
+  const renderRowStatusIcon = (item: NavItem) => {
+    const StatusIcon = item.statusIcon;
+    if (!StatusIcon || !item.statusIconTitle) return null;
+    return (
+      <span
+        className={`pointer-events-none absolute right-2 top-1/2 flex -translate-y-1/2 items-center transition-opacity group-focus-within/nav-row:opacity-0 group-hover/nav-row:opacity-0 group-data-[collapsible=icon]:hidden ${
+          item.statusIconTone === "muted"
+            ? "text-sidebar-foreground/30"
+            : "text-sidebar-foreground/50"
+        }`}
+        data-status-tone={item.statusIconTone ?? "default"}
+        title={item.statusIconTitle}
+      >
+        <StatusIcon aria-hidden="true" className="size-3.5 shrink-0" />
+        <span className="sr-only">{item.statusIconTitle}</span>
+      </span>
+    );
+  };
+
+  const renderRowActions = ({
+    itemKey,
+    item,
+    canDrag,
+    dragProps,
+    moreActionsTitle,
+  }: {
+    itemKey: string;
+    item: NavItem;
+    canDrag: boolean;
+    dragProps?: NavRowDragProps;
+    moreActionsTitle: string;
+  }) => (
+    <div
+      className={`absolute right-1 top-1/2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity group-focus-within/nav-row:opacity-100 group-hover/nav-row:opacity-100 group-data-[collapsible=icon]:hidden ${NAV_ROW_ACTIONS_OPEN_CLASS}`}
+    >
+      {canDrag && (
+        // A dedicated, non-navigational handle carries the drag listeners —
+        // NOT the row's <a>/SPALink. dnd-kit's PointerSensor calls
+        // setPointerCapture on the actual event.target, so if the listeners
+        // were spread onto a row wrapping a link, the browser fires a spurious
+        // click (navigation) on that link right after the drop.
+        <button
+          className={`${NAV_ROW_ACTION_BUTTON} cursor-grab text-sidebar-foreground/50 active:cursor-grabbing`}
+          onClick={(e) => e.stopPropagation()}
+          title={labels?.dragToReorder ?? "Drag to reorder"}
+          type="button"
+          {...(dragProps?.attributes ?? {})}
+          {...(dragProps?.listeners ?? {})}
+        >
+          <GripVertical />
+          <span className="sr-only">{labels?.dragToReorder ?? "Drag to reorder"}</span>
+        </button>
+      )}
+      {item.onAddChild && (
+        <button
+          className={`${NAV_ROW_ACTION_BUTTON} text-sidebar-foreground/70`}
+          onClick={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            item.onAddChild?.();
+          }}
+          title={item.addChildTitle ?? labels?.new ?? "New"}
+          type="button"
+        >
+          <Plus />
+          <span className="sr-only">{item.addChildTitle ?? labels?.new ?? "New"}</span>
+        </button>
+      )}
+      {item.onDelete && item.id && (
+        <button
+          className={`${NAV_ROW_ACTION_BUTTON} text-sidebar-foreground/70`}
+          onClick={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (item.id) item.onDelete?.(item.id);
+          }}
+          title={labels?.delete ?? "Delete"}
+          type="button"
+        >
+          <Trash2 />
+          <span className="sr-only">{labels?.delete ?? "Delete"}</span>
+        </button>
+      )}
+      {item.actions && item.actions.length > 0 && (
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <button
+              className={`${NAV_ROW_ACTION_BUTTON} text-sidebar-foreground/70 data-[state=open]:bg-sidebar-accent`}
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+              }}
+              title={moreActionsTitle}
+              type="button"
+            >
+              <MoreHorizontal />
+              <span className="sr-only">{moreActionsTitle}</span>
+            </button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            {renderActionItems(item.actions, itemKey)}
+          </DropdownMenuContent>
+        </DropdownMenu>
+      )}
+    </div>
+  );
+
+  /** How many hover controls a row will render — drives its trailing padding. */
+  const countRowActions = (item: NavItem, canDrag: boolean) =>
+    (canDrag ? 1 : 0) +
+    (item.onAddChild ? 1 : 0) +
+    (item.onDelete && item.id ? 1 : 0) +
+    (item.actions?.length ? 1 : 0);
+
+  /**
+   * Trailing slots a row must reserve. The status marker is always visible, so
+   * a row carrying one needs its slot reserved even when it has no hover
+   * controls at all — otherwise a long title runs underneath it.
+   */
+  const countRowTrailingSlots = (item: NavItem, canDrag: boolean) =>
+    Math.max(countRowActions(item, canDrag), item.statusIcon && item.statusIconTitle ? 1 : 0);
+
   // A subtree is "active" if the item itself, or ANY descendant at any depth,
   // matches the current route — used to auto-open every ancestor folder along
   // the path to the active row, regardless of nesting depth.
@@ -378,20 +848,36 @@ function NavMainComponent({
     keyPrefix: string,
     depth: number,
     isSiblingActiveMatch = false,
+    /**
+     * Whether the GROUP this row belongs to opted into drag-and-drop
+     * (`NavGroup.draggable`). Threaded down the recursion rather than read from
+     * a closure so a nested row can never disagree with its own group.
+     */
+    groupDraggable = false,
   ): ReactNode => {
+    const rowDragEnabled = dragEnabled && groupDraggable;
     const Icon = item.icon;
     const itemKey = getNavItemKey(item, index, keyPrefix);
     // Label for the per-row "•••" action menu — shared by the folder row and
     // both leaf rows (they all render `item.actions` the same way).
-    const moreActionsTitle = item.moreActionsTitle ?? "More";
+    const moreActionsTitle = item.moreActionsTitle ?? labels?.more ?? "More";
     // A folder is open when it (or one of its descendants, at any depth) is
     // the active route, or when manually expanded. Selecting a folder thus
     // also expands it, and navigating away collapses it again.
     const isActiveTree =
       Boolean(item.isActive) ||
       isPathActive(item.url) ||
+      // Consumer-supplied ancestor chain FIRST-CLASS alongside the `items`
+      // walk below, not as a fallback to it: the walk cannot see unloaded
+      // children, which is exactly the cold-load case this covers.
+      (!!item.id && (activeAncestorIds?.has(item.id) ?? false)) ||
       (item.items?.some((subItem) => isDescendantActive(subItem)) ?? false);
-    const isOpen = isActiveTree || (openOverrides[itemKey] ?? false);
+    // Whatever survived the pruning effect (see `openOverrides`) is by
+    // definition still valid: an expand, or a collapse whose location has not
+    // changed since. Its absence — never set, or since pruned — falls back to
+    // the route-derived default.
+    const override = openOverrides[itemKey];
+    const isOpen = override !== undefined ? override.open : isActiveTree;
 
     // If item declares sub-items, render as a folder-style row, even when the
     // current folder is empty. `hasChildren` alone (no `items` loaded yet —
@@ -403,39 +889,28 @@ function NavMainComponent({
       // `renderFolderRow` below — TS doesn't carry a property narrow
       // (`item.items`) across a nested closure boundary.
       const folderItems = item.items ?? [];
-      const canDrag = dragEnabled && Boolean(item.id);
-      const hoverActionCount =
-        (item.onAddChild ? 1 : 0) + (item.actions?.length ? 1 : 0) + (canDrag ? 1 : 0);
+      const canDrag = rowDragEnabled && Boolean(item.id);
+      const hoverActionCount = countRowActions(item, canDrag);
       const hasHoverActions = hoverActionCount > 0;
-      const trailingPadding =
-        hoverActionCount === 0
-          ? "pr-2"
-          : hoverActionCount === 1
-            ? "pr-[2.5rem]"
-            : hoverActionCount === 2
-              ? "pr-[4.25rem]"
-              : "pr-[6rem]";
-      const addChildTitle = item.addChildTitle ?? "New";
+      const trailingPadding = navRowTrailingPadding(countRowTrailingSlots(item, canDrag));
       const ItemWrapper = depth === 0 ? SidebarMenuItem : SidebarMenuSubItem;
       const renderFolderRow = (dragProps?: NavRowDragProps) => (
         <Collapsible
           key={itemKey}
           asChild
           open={isOpen}
+          // Records the user's explicit intent only. The lazy-children fetch
+          // is NOT kicked off from here — see `NavLazyExpandTrigger` below for
+          // why it keys off the rendered open state instead of this event.
           onOpenChange={(open) => {
-            setOpenOverrides((prev) => ({ ...prev, [itemKey]: open }));
-            // Fire the lazy-load signal only on the actual "needs children"
-            // transition — a folder that already has `items` loaded (or is
-            // being closed) never triggers a refetch.
-            if (open && item.hasChildren && !item.items?.length) {
-              onExpand?.(item);
-            }
+            setOpenOverrides((prev) => ({ ...prev, [itemKey]: { open, at: location } }));
           }}
           className="group/collapsible"
         >
           <ItemWrapper>
             <div
               ref={dragProps?.setNodeRef}
+              data-nav-url={item.url || undefined}
               style={dragProps?.style}
               // The sortable ref binds to just this header row, NOT the outer
               // list item — that <li> also wraps the expanded
@@ -445,7 +920,7 @@ function NavMainComponent({
               // expanded children) can out-compete its own children as the
               // "closest" drop target, making it nearly impossible to drop
               // between two rows inside an open folder.
-              className={`group/nav-tree-item relative flex h-8 min-w-0 items-center rounded-md transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground ${
+              className={`group/nav-row relative flex h-8 min-w-0 items-center rounded-md transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground ${
                 isPathActive(item.url) ? "bg-sidebar-accent text-sidebar-accent-foreground" : ""
               } ${dropIndicatorClass(item.id)}`}
             >
@@ -458,7 +933,7 @@ function NavMainComponent({
                   // without this the toggle becomes unclickable once a folder is
                   // nested 3+ levels deep.
                   className="relative z-10 flex size-7 shrink-0 items-center justify-center rounded-md p-0 text-sidebar-foreground/70 outline-none ring-sidebar-ring transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 group-data-[collapsible=icon]:hidden"
-                  title="Toggle"
+                  title={labels?.toggle ?? "Toggle"}
                   type="button"
                 >
                   <ChevronRight
@@ -466,7 +941,7 @@ function NavMainComponent({
                       isOpen ? "rotate-90" : ""
                     }`}
                   />
-                  <span className="sr-only">Toggle</span>
+                  <span className="sr-only">{labels?.toggle ?? "Toggle"}</span>
                 </button>
               </CollapsibleTrigger>
               {item.url ? (
@@ -510,65 +985,9 @@ function NavMainComponent({
                   </button>
                 </CollapsibleTrigger>
               )}
-              {hasHoverActions && (
-                <div className="absolute right-1 flex items-center gap-0.5 opacity-0 transition-opacity group-focus-within/nav-tree-item:opacity-100 group-hover/nav-tree-item:opacity-100 group-data-[collapsible=icon]:hidden">
-                  {canDrag && (
-                    // A dedicated, non-navigational handle carries the drag
-                    // listeners — NOT the row's <a>/SPALink. dnd-kit's
-                    // PointerSensor calls setPointerCapture on the actual
-                    // event.target, so if the listeners were spread onto a
-                    // row wrapping a link, the browser fires a spurious click
-                    // (navigation) on that link right after the drop.
-                    <button
-                      className="flex size-7 cursor-grab items-center justify-center rounded-md p-0 text-sidebar-foreground/50 outline-none ring-sidebar-ring transition-colors hover:bg-sidebar-accent hover:text-sidebar-foreground focus-visible:ring-2 active:cursor-grabbing"
-                      onClick={(e) => e.stopPropagation()}
-                      title="Drag to reorder"
-                      type="button"
-                      {...(dragProps?.attributes ?? {})}
-                      {...(dragProps?.listeners ?? {})}
-                    >
-                      <GripVertical className="size-3.5 shrink-0" />
-                      <span className="sr-only">Drag to reorder</span>
-                    </button>
-                  )}
-                  {item.onAddChild && (
-                    <button
-                      className="flex size-7 items-center justify-center rounded-md p-0 text-sidebar-foreground/70 outline-none ring-sidebar-ring transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2"
-                      onClick={(e) => {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        item.onAddChild?.();
-                      }}
-                      title={addChildTitle}
-                      type="button"
-                    >
-                      <Plus className="size-3.5 shrink-0" />
-                      <span className="sr-only">{addChildTitle}</span>
-                    </button>
-                  )}
-                  {item.actions && item.actions.length > 0 && (
-                    <DropdownMenu>
-                      <DropdownMenuTrigger asChild>
-                        <button
-                          className="flex size-7 items-center justify-center rounded-md p-0 text-sidebar-foreground/70 outline-none ring-sidebar-ring transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 data-[state=open]:bg-sidebar-accent data-[state=open]:opacity-100"
-                          onClick={(e) => {
-                            e.preventDefault();
-                            e.stopPropagation();
-                          }}
-                          title={moreActionsTitle}
-                          type="button"
-                        >
-                          <MoreHorizontal className="size-3.5 shrink-0" />
-                          <span className="sr-only">{moreActionsTitle}</span>
-                        </button>
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent align="end">
-                        {renderActionItems(item.actions, itemKey)}
-                      </DropdownMenuContent>
-                    </DropdownMenu>
-                  )}
-                </div>
-              )}
+              {renderRowStatusIcon(item)}
+              {hasHoverActions &&
+                renderRowActions({ itemKey, item, canDrag, dragProps, moreActionsTitle })}
             </div>
             <CollapsibleContent>
               {/* Tighter indentation than kui's default (mx-3.5/px-2.5) — this
@@ -576,8 +995,16 @@ function NavMainComponent({
                   a folder nested 3-4 levels deep can eat most of the sidebar's
                   width before any title text renders, truncating even short
                   names ("Purchase Orders" -> "Pu..."). Still keeps the
-                  border-l hierarchy cue, just narrower. */}
-              <SidebarMenuSub className="mx-2 px-1.5">
+                  border-l hierarchy cue, just narrower.
+
+                  LEFT-only (`ml`/`pl`, not `mx`/`px`): the indent is a
+                  hierarchy cue and belongs on the leading edge. Applying it
+                  symmetrically also pulled every child's RIGHT edge 13px in
+                  from its parent folder's (measured: folder row ended at
+                  x=247, its children at x=234 on a 255px sidebar), so the
+                  hover controls of a folder and of its own children never
+                  lined up in the same column. */}
+              <SidebarMenuSub className="ml-2 mr-0 translate-x-0 pl-1.5 pr-0">
                 {(() => {
                   // The active sub-item is the longest url that the location
                   // matches exactly or as a descendant route (e.g. a
@@ -596,9 +1023,19 @@ function NavMainComponent({
                       `${itemKey}:sub`,
                       depth + 1,
                       !!subItem.url && subItem.url === activeSubUrl,
+                      // Children inherit the group's opt-in — a draggable group
+                      // is draggable all the way down, at every depth.
+                      groupDraggable,
                     ),
                   );
                 })()}
+                {/* Asks the consumer for this folder's children the first
+                    time it is rendered open with none loaded — however it got
+                    opened (chevron, folder-name navigation, or an active
+                    descendant route). Renders nothing itself. */}
+                {isOpen && item.hasChildren && folderItems.length === 0 && onExpand && (
+                  <NavLazyExpandTrigger item={item} onExpand={onExpand} />
+                )}
                 {/* Lazy-load placeholder: shown only while a `hasChildren`
                     folder's children are being fetched (never alongside
                     already-loaded `items`, which render above instead). Plain
@@ -616,8 +1053,14 @@ function NavMainComponent({
           </ItemWrapper>
         </Collapsible>
       );
-      return dragEnabled && item.id ? (
-        <DraggableRow key={itemKey} id={item.id} render={renderFolderRow} />
+      return rowDragEnabled && item.id ? (
+        <DraggableRow
+          key={itemKey}
+          id={item.id}
+          depth={depth}
+          isContainer
+          render={renderFolderRow}
+        />
       ) : (
         renderFolderRow()
       );
@@ -628,12 +1071,15 @@ function NavMainComponent({
     // keeps the more compact SidebarMenuSubButton row — same as before this
     // became recursive, just now available at every depth, not only depth 1.
     if (depth === 0) {
+      const leafCanDrag = rowDragEnabled && Boolean(item.id);
+      const leafActionCount = countRowActions(item, leafCanDrag);
       const renderLeafRow = (dragProps?: NavRowDragProps) => (
         <SidebarMenuItem
           key={itemKey}
           ref={dragProps?.setNodeRef}
+          data-nav-url={item.url || undefined}
           style={dragProps?.style}
-          className={dropIndicatorClass(item.id)}
+          className={`group/nav-row ${dropIndicatorClass(item.id)}`}
         >
           {item.onClick ? (
             // Items with onClick trigger a callback instead of navigation
@@ -652,7 +1098,9 @@ function NavMainComponent({
               isActive={
                 location === item.url || (item.url !== "/" && location.startsWith(`${item.url}/`))
               }
-              className="hover:bg-accent data-[active=true]:bg-accent"
+              className={`hover:bg-accent data-[active=true]:bg-accent ${
+                item.statusIcon && item.statusIconTitle ? "pr-8" : ""
+              }`}
             >
               {isExternalUrl(item.url) ? (
                 // External link - use regular anchor tag
@@ -675,71 +1123,25 @@ function NavMainComponent({
               {item.badge}
             </SidebarMenuBadge>
           )}
-          {/* Generic per-row action menu (e.g. Permissions) — additive: only
-              renders when a caller supplies `actions`, so existing leaf rows
-              are unchanged. Sits left of the drag handle. A leaf using both
-              `onDelete` and `actions` alongside drag isn't a current pattern;
-              revisit the right-offsets if that combination ever appears. */}
-          {item.actions && item.actions.length > 0 && (
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <SidebarMenuAction
-                  showOnHover
-                  onClick={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                  }}
-                  title={moreActionsTitle}
-                  className={`group-data-[collapsible=icon]:hidden data-[state=open]:bg-sidebar-accent data-[state=open]:opacity-100 ${
-                    dragEnabled && item.id ? "right-7" : ""
-                  }`}
-                >
-                  <MoreHorizontal />
-                  <span className="sr-only">{moreActionsTitle}</span>
-                </SidebarMenuAction>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end">
-                {renderActionItems(item.actions, itemKey)}
-              </DropdownMenuContent>
-            </DropdownMenu>
-          )}
-          {item.onDelete && item.id && (
-            <SidebarMenuAction
-              showOnHover
-              onClick={(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                if (item.id) {
-                  item.onDelete?.(item.id);
-                }
-              }}
-              title="Delete"
-              className={`group-data-[collapsible=icon]:hidden ${
-                dragEnabled && item.id ? "right-7" : ""
-              }`}
-            >
-              <Trash2 />
-            </SidebarMenuAction>
-          )}
-          {dragEnabled && item.id && (
-            // See the folder-row comment above: the handle, not the row/link,
-            // must own the drag listeners.
-            <SidebarMenuAction
-              showOnHover
-              onClick={(e) => e.stopPropagation()}
-              title="Drag to reorder"
-              type="button"
-              className="cursor-grab active:cursor-grabbing group-data-[collapsible=icon]:hidden"
-              {...(dragProps?.attributes ?? {})}
-              {...(dragProps?.listeners ?? {})}
-            >
-              <GripVertical />
-            </SidebarMenuAction>
-          )}
+          {renderRowStatusIcon(item)}
+          {leafActionCount > 0 &&
+            renderRowActions({
+              itemKey,
+              item,
+              canDrag: leafCanDrag,
+              dragProps,
+              moreActionsTitle,
+            })}
         </SidebarMenuItem>
       );
-      return dragEnabled && item.id ? (
-        <DraggableRow key={itemKey} id={item.id} render={renderLeafRow} />
+      return rowDragEnabled && item.id ? (
+        <DraggableRow
+          key={itemKey}
+          id={item.id}
+          depth={depth}
+          isContainer={false}
+          render={renderLeafRow}
+        />
       ) : (
         renderLeafRow()
       );
@@ -747,26 +1149,20 @@ function NavMainComponent({
 
     const isSubItemActive = isSiblingActiveMatch;
     const SubIcon = item.icon;
-    const hasSubActions = !!(item.actions && item.actions.length > 0);
+    const subCanDrag = rowDragEnabled && Boolean(item.id);
+    const subActionCount = countRowActions(item, subCanDrag);
     const renderSubItemRow = (dragProps?: NavRowDragProps) => (
       <SidebarMenuSubItem
         key={itemKey}
         ref={dragProps?.setNodeRef}
+        data-nav-url={item.url || undefined}
         style={dragProps?.style}
-        className={`group/subitem relative ${dropIndicatorClass(item.id)}`}
+        className={`group/nav-row relative ${dropIndicatorClass(item.id)}`}
       >
         <SidebarMenuSubButton
           asChild
           isActive={isSubItemActive}
-          className={
-            // Reserve trailing room for whichever hover controls exist: one
-            // slot (pr-7) for drag OR the actions menu, two (pr-14) for both.
-            hasSubActions && dragEnabled && item.id
-              ? "pr-14"
-              : hasSubActions || (dragEnabled && item.id)
-                ? "pr-7"
-                : undefined
-          }
+          className={navRowTrailingPadding(countRowTrailingSlots(item, subCanDrag))}
         >
           {isExternalUrl(item.url) ? (
             // External link - use regular anchor tag
@@ -783,51 +1179,25 @@ function NavMainComponent({
             </SPALink>
           )}
         </SidebarMenuSubButton>
-        {/* Generic per-row action menu (e.g. Permissions) for a nested leaf.
-            Additive: only when a caller supplies `actions`. Sits left of the
-            drag handle when both are present. */}
-        {hasSubActions && (
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <button
-                className={`absolute top-1/2 hidden size-5 -translate-y-1/2 items-center justify-center rounded-md p-0 text-sidebar-foreground/60 outline-none ring-sidebar-ring transition-colors hover:bg-sidebar-accent hover:text-sidebar-foreground focus-visible:ring-2 group-hover/subitem:flex data-[state=open]:flex data-[state=open]:bg-sidebar-accent ${
-                  dragEnabled && item.id ? "right-7" : "right-1"
-                }`}
-                onClick={(e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                }}
-                title={moreActionsTitle}
-                type="button"
-              >
-                <MoreHorizontal className="size-3 shrink-0" />
-                <span className="sr-only">{moreActionsTitle}</span>
-              </button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end">
-              {renderActionItems(item.actions ?? [], itemKey)}
-            </DropdownMenuContent>
-          </DropdownMenu>
-        )}
-        {dragEnabled && item.id && (
-          // See the folder-row comment above: the handle, not the row/link,
-          // must own the drag listeners.
-          <button
-            className="absolute right-1 top-1/2 hidden size-5 -translate-y-1/2 cursor-grab items-center justify-center rounded-md p-0 text-sidebar-foreground/50 outline-none ring-sidebar-ring transition-colors hover:bg-sidebar-accent hover:text-sidebar-foreground focus-visible:ring-2 active:cursor-grabbing group-hover/subitem:flex"
-            onClick={(e) => e.stopPropagation()}
-            title="Drag to reorder"
-            type="button"
-            {...(dragProps?.attributes ?? {})}
-            {...(dragProps?.listeners ?? {})}
-          >
-            <GripVertical className="size-3 shrink-0" />
-            <span className="sr-only">Drag to reorder</span>
-          </button>
-        )}
+        {renderRowStatusIcon(item)}
+        {subActionCount > 0 &&
+          renderRowActions({
+            itemKey,
+            item,
+            canDrag: subCanDrag,
+            dragProps,
+            moreActionsTitle,
+          })}
       </SidebarMenuSubItem>
     );
-    return dragEnabled && item.id ? (
-      <DraggableRow key={itemKey} id={item.id} render={renderSubItemRow} />
+    return rowDragEnabled && item.id ? (
+      <DraggableRow
+        key={itemKey}
+        id={item.id}
+        depth={depth}
+        isContainer={false}
+        render={renderSubItemRow}
+      />
     ) : (
       renderSubItemRow()
     );
@@ -837,7 +1207,10 @@ function NavMainComponent({
   const hasDynamicGroup = items.some((group) => group.isDynamic);
 
   const content = (
-    <div className={hasDynamicGroup ? "flex flex-col flex-1 min-h-0 gap-1" : "contents"}>
+    <div
+      ref={navContainerRef}
+      className={hasDynamicGroup ? "flex flex-col flex-1 min-h-0 gap-1" : "contents"}
+    >
       {items.map((group, groupIndex) => {
         const HeaderActionIcon = group.headerAction;
         const GroupIcon = group.icon;
@@ -864,7 +1237,9 @@ function NavMainComponent({
                     type="button"
                     onClick={() => toggleGroupCollapse(groupKey)}
                     className="inline-flex items-center gap-1.5 py-1 rounded-md hover:bg-sidebar-accent transition-colors cursor-pointer"
-                    title={isCollapsed ? "Expand" : "Collapse"}
+                    title={
+                      isCollapsed ? (labels?.expand ?? "Expand") : (labels?.collapse ?? "Collapse")
+                    }
                   >
                     {GroupIcon && <GroupIcon className="size-3 text-sidebar-foreground/50" />}
                     <span className="text-[11px] uppercase tracking-wider font-medium text-sidebar-foreground/50">
@@ -876,8 +1251,17 @@ function NavMainComponent({
                   </button>
                 ) : (
                   <SidebarGroupLabel className="flex-1 flex items-center gap-1.5 text-sidebar-foreground/50 text-[11px] uppercase tracking-wider font-medium h-6">
-                    {GroupIcon && <GroupIcon className="size-3" />}
-                    <span>{group.label}</span>
+                    {/* `labelSlot` swaps the label's CONTENT only — the
+                        `SidebarGroupLabel` wrapper and its typography stay
+                        put, so a custom control (e.g. a filter dropdown)
+                        inherits the exact same size/weight/colour as the
+                        plain text it replaces instead of re-declaring it. */}
+                    {group.labelSlot ?? (
+                      <>
+                        {GroupIcon && <GroupIcon className="size-3" />}
+                        <span>{group.label}</span>
+                      </>
+                    )}
                   </SidebarGroupLabel>
                 )}
               </div>
@@ -911,7 +1295,9 @@ function NavMainComponent({
               )
             ) : (
               <SidebarMenu>
-                {group.items.map((item, itemIndex) => renderNavRow(item, itemIndex, "item", 0))}
+                {group.items.map((item, itemIndex) =>
+                  renderNavRow(item, itemIndex, "item", 0, false, group.draggable ?? false),
+                )}
               </SidebarMenu>
             )}
           </SidebarGroup>
@@ -922,20 +1308,61 @@ function NavMainComponent({
 
   if (!dragEnabled) return content;
 
+  const activeDragTitle = dragState ? dragRowTitles.get(dragState.activeId) : undefined;
+
   return (
     <DndContext
       sensors={sensors}
-      collisionDetection={closestCenter}
+      collisionDetection={collisionDetection}
+      // `Always`, not the default "measure once before dragging": the sidebar is
+      // a scroll container and folders stay interactive mid-drag, so a rect
+      // captured at drag start goes stale the moment the list scrolls. Stale
+      // rects are exactly what this rewrite exists to eliminate.
+      measuring={{ droppable: { strategy: MeasuringStrategy.Always } }}
+      onDragStart={handleDragStart}
       onDragMove={handleDragMove}
       onDragEnd={handleDragEnd}
-      onDragCancel={() => setDrag(null)}
+      onDragCancel={() => {
+        resolvedDropRef.current = null;
+        setDrag(null);
+      }}
     >
-      <SortableContext items={sortableIds} strategy={verticalListSortingStrategy}>
-        {content}
-      </SortableContext>
+      {content}
+      {/* Now that rows no longer translate, nothing would follow the cursor
+          without this — the drag would read as "the row just faded". */}
+      <DragOverlay dropAnimation={null}>
+        {activeDragTitle ? (
+          <div className="pointer-events-none flex h-8 max-w-56 items-center gap-2 truncate rounded-md border border-sidebar-border bg-sidebar px-2 text-sm text-sidebar-foreground shadow-lg">
+            <GripVertical className="size-3.5 shrink-0 text-sidebar-foreground/50" />
+            <span className="truncate">{activeDragTitle}</span>
+          </div>
+        ) : null}
+      </DragOverlay>
     </DndContext>
   );
 }
+
+/**
+ * Do `prev` and `next` carry the same status markers (`NavItem.statusIcon`) on
+ * the row itself AND every descendant?
+ *
+ * The rest of the memo comparison is deliberately shallow — top-level items
+ * only, and for their children just the count. That is fine for fields a caller
+ * changes on the row it rebuilds; a status marker is not one of those. Walks
+ * only until the first difference and reads two fields per row.
+ */
+const sameStatusMarkers = (prev: NavItem, next: NavItem): boolean => {
+  if (prev.statusIcon !== next.statusIcon || prev.statusIconTitle !== next.statusIconTitle) {
+    return false;
+  }
+  const prevChildren = prev.items ?? [];
+  const nextChildren = next.items ?? [];
+  if (prevChildren.length !== nextChildren.length) return false;
+  return prevChildren.every((child, index) => {
+    const nextChild = nextChildren[index];
+    return nextChild !== undefined && sameStatusMarkers(child, nextChild);
+  });
+};
 
 // Memoize component with custom comparison to prevent unnecessary re-renders
 export const NavMain = memo(NavMainComponent, (prevProps, nextProps) => {
@@ -978,6 +1405,12 @@ export const NavMain = memo(NavMainComponent, (prevProps, nextProps) => {
         prevItem.url !== nextItem.url ||
         prevItem.title !== nextItem.title ||
         prevItem.badge !== nextItem.badge ||
+        // Recursive, unlike every other check here: a status marker flips on ONE
+        // row at an arbitrary depth (publish a doc three folders down) while
+        // nothing about its ancestors changes, so the shallow `items.length`
+        // comparison below would keep the whole tree memoized and the marker
+        // would only appear after some unrelated re-render.
+        !sameStatusMarkers(prevItem, nextItem) ||
         prevItem.status !== nextItem.status ||
         prevItem.spaceName !== nextItem.spaceName ||
         prevItem.createdAt !== nextItem.createdAt ||
@@ -1022,6 +1455,10 @@ export const NavMain = memo(NavMainComponent, (prevProps, nextProps) => {
   }
 
   if (prevProps.onTaskListExpandToggle !== nextProps.onTaskListExpandToggle) {
+    return false;
+  }
+
+  if (prevProps.labels !== nextProps.labels) {
     return false;
   }
 

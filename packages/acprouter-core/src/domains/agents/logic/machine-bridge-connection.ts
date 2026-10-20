@@ -5,7 +5,12 @@ import type { AgentStatus } from "../schema/agents";
 import { type OpenWebSocketLike, streamFromWebSocket } from "./acp-ws-stream";
 import { markAgentsDisconnected, upsertBridgedAgent } from "./agents-logic";
 import { registerMachineBridge, unregisterMachineBridge } from "./machine-bridge-registry";
-import { getMachineOwnerId, markMachineOffline, markMachineOnline } from "./machines-logic";
+import {
+  getMachineOwnerId,
+  markMachineOffline,
+  markMachineOnline,
+  verifyMachineBridgeCredential,
+} from "./machines-logic";
 import { displayNameForRegistrySlug } from "./registry-sync";
 import {
   DEFAULT_PERMISSION_TIMEOUT_MS,
@@ -23,9 +28,24 @@ export const MACHINE_BRIDGE_CLOSE_CODE = {
   missingMachineId: 4000,
   unknownMachine: 4001,
   initializeFailed: 4002,
+  invalidCredential: 4003,
 } as const;
 
 const INITIALIZE_TIMEOUT_MS = 10_000;
+
+/**
+ * How the caller (the route handler) found the bridge credential, if any —
+ * computed synchronously from the request, since only the route sees both
+ * the `Authorization` header and the query string at once. `"header"` is
+ * the only acceptable presentation (Task 5.1: "never a query parameter").
+ * `"none"` is valid too — it's what every `enrolledVia: "legacy"` machine
+ * sends, and `verifyMachineBridgeCredential` itself skips the check
+ * entirely for those, regardless of this value.
+ */
+export type PresentedBridgeCredential =
+  | { presentation: "none" }
+  | { presentation: "header"; value: string }
+  | { presentation: "query_param" };
 
 /**
  * Accepts one machine's dial-out bridge socket and plays the ACP CLIENT role
@@ -46,12 +66,19 @@ const INITIALIZE_TIMEOUT_MS = 10_000;
  * reason `dbPromise` below is a Promise rather than an already-resolved
  * `Database` — the caller kicks off `getDb()` unawaited and hands us the
  * promise so wiring the stream never waits on it.
+ *
+ * `presentedCredential` (Task 5.1) defaults to `{presentation: "none"}` so
+ * every existing call site (OSS's `apps/acprouter` route, left entirely
+ * unmodified) keeps behaving exactly as before — the credential check this
+ * adds is a no-op for any machine that doesn't require one.
  */
 export function acceptMachineBridgeConnection(
   dbPromise: Promise<Database>,
   machineId: string | null,
   socket: OpenWebSocketLike & KeepaliveWebSocketLike,
   permissionTimeoutMs: number = DEFAULT_PERMISSION_TIMEOUT_MS,
+  presentedCredential: PresentedBridgeCredential = { presentation: "none" },
+  verifyLiveAuthorization: () => Promise<boolean> = async () => true,
 ): void {
   if (!machineId) {
     socket.close(MACHINE_BRIDGE_CLOSE_CODE.missingMachineId, "missing machineId query param");
@@ -99,7 +126,14 @@ export function acceptMachineBridgeConnection(
     })
     .connect(stream);
 
-  void trackMachineBridgeConnection(dbPromise, machineId, connection, socket);
+  void trackMachineBridgeConnection(
+    dbPromise,
+    machineId,
+    connection,
+    socket,
+    presentedCredential,
+    verifyLiveAuthorization,
+  );
 }
 
 /**
@@ -115,6 +149,8 @@ async function trackMachineBridgeConnection(
   machineId: string,
   connection: acp.ClientConnection,
   socket: OpenWebSocketLike & KeepaliveWebSocketLike,
+  presentedCredential: PresentedBridgeCredential,
+  verifyLiveAuthorization: () => Promise<boolean>,
 ): Promise<void> {
   const db = await dbPromise;
 
@@ -131,6 +167,33 @@ async function trackMachineBridgeConnection(
     // not by reading the SDK source in advance.
     socket.close(MACHINE_BRIDGE_CLOSE_CODE.unknownMachine, "unknown machineId");
     connection.close(new Error(`unknown machine: ${machineId}`));
+    return;
+  }
+
+  // Task 5.1: a credential presented as a QUERY PARAMETER is rejected
+  // outright, before even checking whether it would otherwise have been
+  // valid — the route is the only thing that can tell presentation apart
+  // from validity, and it already made that determination synchronously
+  // from the request; this is just honoring it. A `"none"`/`"header"`
+  // presentation falls through to the real check below, which itself is a
+  // no-op for `enrolledVia: "legacy"` machines regardless of what (if
+  // anything) was presented.
+  const credentialCheck =
+    presentedCredential.presentation === "query_param"
+      ? ({ ok: false, reason: "invalid_credential" } as const)
+      : await verifyMachineBridgeCredential(
+          db,
+          machineId,
+          presentedCredential.presentation === "header" ? presentedCredential.value : null,
+        );
+  if (!credentialCheck.ok) {
+    socket.close(MACHINE_BRIDGE_CLOSE_CODE.invalidCredential, credentialCheck.reason);
+    connection.close(new Error(`bridge credential rejected: ${credentialCheck.reason}`));
+    return;
+  }
+  if (!(await verifyLiveAuthorization().catch(() => false))) {
+    socket.close(MACHINE_BRIDGE_CLOSE_CODE.invalidCredential, "Enrollment authorization ended");
+    connection.close(new Error("Enrollment authorization ended"));
     return;
   }
 

@@ -74,6 +74,12 @@ function SpaceTypeBadge({ space, show }: { space: Space; show: boolean }) {
  * that carries a `description` (white-label hosts) renders that as plain muted
  * text instead, since a sentence does not belong in a badge. Additive — spaces
  * with no `description` render exactly as before.
+ *
+ * `plan: ""` means "this host has no plans", and renders nothing — distinct
+ * from `plan: undefined`, which still falls back to "Free" so every existing
+ * caller keeps its current badge. Uses an empty string rather than widening
+ * the type to `string | null`: eight apps each carry their own local `Space`
+ * type mirroring this one, and none of them needed to change for this.
  */
 function SpaceSubtitle({ space, badgeClassName }: { space: Space; badgeClassName: string }) {
   if (space.description) {
@@ -83,6 +89,7 @@ function SpaceSubtitle({ space, badgeClassName }: { space: Space; badgeClassName
       </span>
     );
   }
+  if (space.plan === "") return null;
   return (
     <span className={`${badgeClassName} ${getPlanBadgeStyle(space.plan ?? "free")}`}>
       {space.plan ?? "Free"}
@@ -184,6 +191,7 @@ export function SpaceSelector({
 
   // Control dropdown open state
   const [isOpen, setIsOpen] = React.useState(false);
+  const [isHydrated, setIsHydrated] = React.useState(false);
   const [scrollRegion, setScrollRegion] = React.useState<HTMLDivElement | null>(null);
   const scrollContentRef = React.useRef<HTMLDivElement>(null);
   const activeSpaceItemRef = React.useRef<HTMLDivElement>(null);
@@ -192,6 +200,12 @@ export function SpaceSelector({
 
   const currentSpace = activeSpace || internalActiveSpace;
   const logoSrc = currentSpace?.logo || appLogo;
+
+  // Streaming SSR can expose this button before React attaches the dropdown
+  // handler. Keep it disabled until hydration so an early click is not lost.
+  React.useEffect(() => {
+    setIsHydrated(true);
+  }, []);
 
   const updateScrollAffordances = React.useCallback(() => {
     if (!scrollRegion) return;
@@ -294,6 +308,7 @@ export function SpaceSelector({
         <DropdownMenu open={isOpen} onOpenChange={setIsOpen}>
           <DropdownMenuTrigger asChild>
             <SidebarMenuButton
+              disabled={!isHydrated}
               size={compact ? "default" : "lg"}
               className={cn(
                 "data-[state=open]:bg-sidebar-accent data-[state=open]:text-sidebar-accent-foreground",

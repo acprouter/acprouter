@@ -3,6 +3,13 @@ import os from "node:os";
 export interface RedeemSuccess {
   machineId: string;
   intendedAgentSlug: string | null;
+  /**
+   * Raw one-time bridge credential (task #6.4) — only present when the
+   * redeemed token carried a `grantId` (oauth-enrollment path). `undefined`
+   * for the legacy path, matching the server's own omit-not-null contract
+   * (`RedeemEnrollmentTokenOutputSchema.bridgeCredential`).
+   */
+  bridgeCredential?: string;
 }
 
 export class RedeemError extends Error {
@@ -30,6 +37,7 @@ export async function redeemEnrollmentToken(
   try {
     response = await fetch(url, {
       method: "POST",
+      redirect: "manual",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         token,
@@ -42,6 +50,13 @@ export async function redeemEnrollmentToken(
     throw new RedeemError(
       "network_error",
       `Could not reach ${server}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  if (response.status >= 300 && response.status < 400) {
+    throw new RedeemError(
+      "unexpected_redirect",
+      "Router redirected enrollment. Check the server origin and try again.",
     );
   }
 
@@ -58,5 +73,7 @@ export async function redeemEnrollmentToken(
   }
   const intendedAgentSlug =
     typeof body?.intendedAgentSlug === "string" ? body.intendedAgentSlug : null;
-  return { machineId: body.machineId, intendedAgentSlug };
+  const bridgeCredential =
+    typeof body?.bridgeCredential === "string" ? body.bridgeCredential : undefined;
+  return { machineId: body.machineId, intendedAgentSlug, bridgeCredential };
 }

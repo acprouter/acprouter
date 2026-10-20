@@ -1,10 +1,16 @@
 import { eventIterator, oc } from "@orpc/contract";
 import { z } from "zod";
-import { AgentVOSchema, ConnectRemoteAcpAgentInputSchema } from "../types/agent";
+import {
+  AgentVOSchema,
+  ConnectRemoteAcpAgentInputSchema,
+  RemoveAgentInputSchema,
+  RemoveAgentOutputSchema,
+} from "../types/agent";
 import {
   AgentSessionStreamEventVOSchema,
   AnswerAgentSessionPermissionInputSchema,
   AnswerAgentSessionPermissionOutputSchema,
+  CancelAgentTurnInputSchema,
   EndAgentSessionInputSchema,
   GetAgentSessionHistoryInputSchema,
   PromptAgentSessionInputSchema,
@@ -44,6 +50,16 @@ export const agentsContract = oc.router({
      * new row to the same card renderer `list` already feeds.
      */
     connectRemoteAcp: oc.input(ConnectRemoteAcpAgentInputSchema).output(AgentVOSchema),
+    /**
+     * Soft-removes a `disconnected` agent row — `connected`, `auth_required`,
+     * and `error` are all rejected (spec:
+     * `acp-agent-management/remove-disconnected-agent`). `remove`, not
+     * `delete` — this is a soft delete (`deletedAt`), never a physical
+     * `DELETE`, and the name should not imply otherwise. Same `{ ok }` shape
+     * as `consumerKeys.revoke`: the dashboard only needs to know whether to
+     * drop the card from its list, not the removed row's content.
+     */
+    remove: oc.input(RemoveAgentInputSchema).output(RemoveAgentOutputSchema),
   }),
   /**
    * Task #14 — the credential external ACP consumers (spec §5.3 point 1)
@@ -90,6 +106,14 @@ export const agentsContract = oc.router({
      * (called from a `useEffect` cleanup, which cannot `await`).
      */
     end: oc.input(EndAgentSessionInputSchema).output(z.object({ ok: z.boolean() })),
+    /**
+     * The stop button: cancels the turn currently in flight, keeping the
+     * session open for another prompt. Fire-and-forget, same as `end` — ACP's
+     * `session/cancel` is a notification, and the in-flight `prompt` request
+     * resolves on its own once the agent responds with `stopReason:
+     * "cancelled"`.
+     */
+    cancelTurn: oc.input(CancelAgentTurnInputSchema).output(z.object({ ok: z.boolean() })),
     /**
      * Real persisted history, in `seq` order (task #12 step 3) — reads back
      * `acprouter_agent_session_events`, the durable log every event above

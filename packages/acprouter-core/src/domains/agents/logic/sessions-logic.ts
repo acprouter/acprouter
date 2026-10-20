@@ -1,16 +1,23 @@
-import type {
-  AgentSessionStreamEventVO,
-  AnswerAgentSessionPermissionOutput,
+import { buildPromptContent } from "@acp-ui/core/prompt";
+import {
+  type AgentSessionStreamEventVO,
+  type AnswerAgentSessionPermissionOutput,
+  type PromptAttachmentInput,
+  parseBridgeSessionMeta,
 } from "@acprouter/contract";
 import * as acp from "@agentclientprotocol/sdk";
 import { ORPCError } from "@orpc/server";
+import { and, eq, isNull } from "drizzle-orm";
 import type WebSocket from "ws";
+import { resolveOwnerId } from "../../../context";
 import type { Database } from "../../../db";
+import { acprouterAgentSessions } from "../schema/agent-sessions";
 import type { AgentPO } from "../schema/agents";
+import { acprouterAgents } from "../schema/agents";
 import { streamFromWebSocket } from "./acp-ws-stream";
-import { decryptAgentApiKey } from "./agent-credential-crypto";
 import { getAgentById } from "./agents-logic";
 import { getMachineBridge } from "./machine-bridge-registry";
+import { resolveRemoteAcpBearerToken } from "./remote-agent-credential";
 import {
   dialRemoteAcpSocket,
   getAgentCredentialById,
@@ -21,6 +28,11 @@ import {
   getRemoteSessionConnection,
   registerRemoteSessionConnection,
 } from "./remote-session-registry";
+import {
+  forgetSessionCapabilities,
+  getSessionCapabilities,
+  rememberSessionCapabilities,
+} from "./session-capabilities-registry";
 import { sweepAgentSessionEvents } from "./session-events-logic";
 import {
   answerSessionPermission,
@@ -32,12 +44,7 @@ import {
   toStreamEventVO,
   watchSession,
 } from "./session-relay-registry";
-import {
-  getSessionAgentId,
-  insertActiveSession,
-  markSessionActive,
-  markSessionEnded,
-} from "./session-status-logic";
+import { getSessionAgentId, markSessionActive, markSessionEnded } from "./session-status-logic";
 
 /**
  * What both `bridged` and `remote-acp` agents boil down to, from
@@ -207,14 +214,23 @@ async function dialRemoteAcpConnectionForSession(
     });
   }
   const credential = await getAgentCredentialById(db, agent.credentialId);
-  if (!credential) {
+  // `getAgentCredentialById` looks up by credential id alone — re-check it
+  // actually belongs to THIS agent before using it as a bearer token. A
+  // stale/mismatched `agent.credentialId` (e.g. a reused id after a
+  // reconnect, or a bug elsewhere writing the wrong id) must never let one
+  // agent's session dial with a different agent's credential.
+  if (!credential || credential.agentId !== agent.id) {
     throw new ORPCError("PRECONDITION_FAILED", {
       message: `"${agent.label}"'s stored credential is missing — reconnect it from the Agents page.`,
     });
   }
-  const apiKey = decryptAgentApiKey(credential.encryptedPayload);
+  // Decodes by the credential's own `kind` and, for `oauth` credentials
+  // near/at `expiresAt`, refreshes against Buda first and persists the new
+  // token set — never the raw envelope string (PUL-335: `encryptedPayload`
+  // for an `oauth` row is JSON, not a bearer token).
+  const bearerToken = await resolveRemoteAcpBearerToken(db, credential);
 
-  const socket = await dialRemoteAcpSocket(agent.endpoint, apiKey);
+  const socket = await dialRemoteAcpSocket(agent.endpoint, bearerToken);
   const dbPromise = Promise.resolve(db);
   const connection = acp
     .client({ name: "acprouter" })
@@ -284,9 +300,76 @@ export async function startAgentSession(
   }
   resolved.onSessionCreated(response.sessionId);
 
+  // Registered BEFORE the lock+insert transaction below, not after: if
+  // `removeAgent` wins the race (see that transaction's comment) and ends
+  // this session, its post-commit cleanup
+  // (`closeRemoteSessionConnection`/`forgetSessionCapabilities`) must find a
+  // live entry to tear down. Registering only on our own success path would
+  // leave that connection/capabilities entry orphaned in memory forever —
+  // `removeAgent` only cleans up sessions it saw committed in its own
+  // transaction, and never retries later.
+  //
+  // The ONLY point at which a bridged session's real agent capabilities are
+  // knowable: the CLI spawns the agent inside this `session/new` and reports
+  // its `initialize` result back on the response `_meta`. A CLI built before
+  // that exists sends nothing, which parses to `null` and leaves the session
+  // un-negotiated — the same send-everything behaviour it always had.
+  rememberSessionCapabilities(
+    response.sessionId,
+    parseBridgeSessionMeta(response._meta)?.promptCapabilities ?? null,
+  );
+
+  // Locks the agent row with `FOR UPDATE` inside the same transaction as the
+  // session insert, rather than a plain re-read followed by a separate
+  // insert — `removeAgent` takes the same row lock for its soft-delete, so
+  // the two serialize: whichever commits first is what the other sees.
+  // Without the shared lock, a `removeAgent` that commits in the window
+  // between a plain re-read and this insert would already have run its
+  // "end every live session for this agent" sweep, find no row for this
+  // session yet (it hasn't been inserted), and never come back to end it —
+  // leaving a live, usable session on an agent id the user already removed.
+  // Same pattern as `consumer-api-keys-logic.ts`'s `mintConsumerApiKey`.
   try {
-    await insertActiveSession(db, { id: response.sessionId, agentId: agent.id, consumerId: null });
+    await db.transaction(async (tx) => {
+      const [stillActive] = await tx
+        .select({ id: acprouterAgents.id })
+        .from(acprouterAgents)
+        .where(
+          and(
+            eq(acprouterAgents.id, agent.id),
+            eq(acprouterAgents.ownerId, resolveOwnerId()),
+            isNull(acprouterAgents.deletedAt),
+          ),
+        )
+        .for("update");
+      if (!stillActive) {
+        throw new ORPCError("NOT_FOUND", {
+          message: `No agent registered with id "${agent.id}".`,
+        });
+      }
+      // Inlined on `tx` directly rather than calling `insertActiveSession`
+      // (which takes a plain `Database`) — drizzle's transaction client type
+      // isn't structurally assignable to the `Database` union, same
+      // constraint `remote-agent-credential.ts`'s own locked transaction
+      // works around the identical way.
+      await tx.insert(acprouterAgentSessions).values({
+        id: response.sessionId,
+        agentId: agent.id,
+        consumerId: null,
+        status: "active",
+      });
+    });
   } catch (error) {
+    if (error instanceof ORPCError && error.code === "NOT_FOUND") {
+      resolved.onSessionCreateFailed(error);
+      forgetSessionCapabilities(response.sessionId);
+      throw error;
+    }
+    // A real persistence failure (not the ownership race above) — best
+    // effort, same posture as `machine-bridge-connection.ts`'s
+    // `reportBridgedAgentFromInitialize`: the real ACP session already
+    // exists and must not be torn down over a logging-worthy but
+    // non-fatal DB error.
     console.error(
       `[acprouter] failed to persist session row sessionId=${response.sessionId}: ${String(error)}`,
     );
@@ -298,6 +381,13 @@ export async function startAgentSession(
   return { sessionId: response.sessionId };
 }
 
+/**
+ * ACP's `PromptRequest.prompt` is a `ContentBlock[]`, not a bare string — a
+ * text block first (possibly empty, when the user sent only attachments;
+ * `PromptAgentSessionInputSchema`'s refine already guarantees at least one of
+ * text/attachments is real), then one image/audio block per attachment, in
+ * the order the browser attached them.
+ */
 /**
  * The streaming leg (task #11, acceptance criterion 1): sends a real
  * `session/prompt` to the machine's spawned agent through the live bridge
@@ -321,13 +411,37 @@ export async function startAgentSession(
  */
 export async function* promptAgentSession(
   db: Database,
-  input: { agentId: string; sessionId: string; text: string },
+  input: {
+    agentId: string;
+    sessionId: string;
+    text: string;
+    attachments?: PromptAttachmentInput[];
+  },
 ): AsyncGenerator<AgentSessionStreamEventVO, void, void> {
-  const { connection } = await resolveConnectionForExistingSession(
+  const { agent, connection } = await resolveConnectionForExistingSession(
     db,
     input.agentId,
     input.sessionId,
   );
+
+  // Negotiated, never assumed: ACP makes `image`, `audio` and
+  // `embeddedContext` opt-in capabilities an agent must advertise, so an
+  // attachment can be valid and still be unsendable to THIS one.
+  //
+  // Two sources, most specific first. A `bridged` machine spawns a fresh
+  // agent per session, so only the SESSION knows what it can take — the
+  // agent row describes the machine's pinned agent, and the bridge's own
+  // `initialize` advertises only what the CLI itself implements. A
+  // `remote-acp` agent is one fixed endpoint, so its row is authoritative and
+  // there is no per-session entry to find. `null` from both means "no
+  // negotiation available" (an old CLI, most likely): send everything,
+  // exactly as before, rather than withholding a user's attachment on the
+  // strength of information we do not have.
+  const promptCapabilities =
+    getSessionCapabilities(input.sessionId) ??
+    (agent.capabilities?.promptCapabilities as acp.PromptCapabilities | undefined) ??
+    null;
+  const { prompt, notes } = buildPromptContent(input.text, input.attachments, promptCapabilities);
 
   // Best-effort, fire-and-forget (task #12): re-arms `"active"` for a
   // session that read `"idle"` after a previous turn. Never awaited — must
@@ -343,7 +457,7 @@ export async function* promptAgentSession(
   void connection.agent
     .request(acp.methods.agent.session.prompt, {
       sessionId: input.sessionId,
-      prompt: [{ type: "text", text: input.text }],
+      prompt,
     })
     .then((response) => {
       emitSessionTerminal(Promise.resolve(db), input.sessionId, {
@@ -362,6 +476,14 @@ export async function* promptAgentSession(
         reason: `The prompt failed: ${error instanceof Error ? error.message : String(error)}`,
       });
     });
+
+  // After the request is in flight, so the `watchSession` → prompt-request
+  // pairing above stays in one synchronous tick (a `yield` suspends this
+  // generator until the consumer pulls, which before that pairing would
+  // delay the request itself and lose the start of the reply).
+  for (const note of notes) {
+    yield { type: "note", text: note };
+  }
 
   try {
     for await (const event of events) {
@@ -445,10 +567,40 @@ export async function endAgentSession(
     if (agent.kind === "remote-acp") {
       closeRemoteSessionConnection(input.sessionId);
     }
+    // The process those capabilities described is gone; a long-lived Router
+    // must not accumulate one entry per session it ever ran.
+    forgetSessionCapabilities(input.sessionId);
     void markSessionEnded(db, input.sessionId).catch((error: unknown) => {
       console.error(
         `[acprouter] failed to mark session ended sessionId=${input.sessionId}: ${String(error)}`,
       );
+    });
+    return { ok: true };
+  } catch {
+    return { ok: false };
+  }
+}
+
+/**
+ * The stop button. Narrower than `endAgentSession`: notifies the same
+ * `session/cancel`, but does not mark the session row `"ended"` and does not
+ * close a `remote-acp` connection — the session stays open for another
+ * prompt. The pending `promptAgentSession` request resolves on its own once
+ * the agent responds, `stopReason: "cancelled"` included, so there is
+ * nothing else this needs to do to unwind the in-flight turn.
+ */
+export async function cancelAgentTurn(
+  db: Database,
+  input: { agentId: string; sessionId: string },
+): Promise<{ ok: boolean }> {
+  try {
+    const { connection } = await resolveConnectionForExistingSession(
+      db,
+      input.agentId,
+      input.sessionId,
+    );
+    await connection.agent.notify(acp.methods.agent.session.cancel, {
+      sessionId: input.sessionId,
     });
     return { ok: true };
   } catch {

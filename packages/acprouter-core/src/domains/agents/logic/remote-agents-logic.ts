@@ -7,10 +7,11 @@ import { WebSocket } from "ws";
 import { resolveOwnerId } from "../../../context";
 import type { Database } from "../../../db";
 import { acprouterAgentCredentials, acprouterAgents } from "../../../db/schema";
-import type { AgentCredentialPO } from "../schema/agent-credentials";
+import type { AgentCredentialKind, AgentCredentialPO } from "../schema/agent-credentials";
 import { streamFromWebSocket } from "./acp-ws-stream";
 import { encryptAgentApiKey } from "./agent-credential-crypto";
 import { toAgentVO } from "./agents-logic";
+import type { StoredOAuthCredential } from "./stored-oauth-credential";
 
 /**
  * `remote-acp` (Buda, spec §5.2/§2b Story B) — nothing to install, nothing
@@ -126,26 +127,29 @@ export interface ConnectRemoteAcpAgentInput {
 }
 
 /**
- * Story B / spec §2b's Buda Add flow: "Submit connects immediately — there
- * is no detection step because there is no process to detect." Validates
- * the endpoint+key for REAL before persisting anything — a real dial and a
- * real `initialize`, not a format check — so a card never goes green over a
- * credential this Router never actually proved works (spec §3's "silent
- * auto-approval"-adjacent failure mode, applied to enrollment itself).
- *
- * The socket opened here is a THROWAWAY PROBE, not the connection a later
- * prompt-box session uses: `sessions-logic.ts#startAgentSession` dials its
- * own fresh connection per session (spec §11 point 6 / this domain's
- * `remote-session-registry.ts` doc comment explain why `remote-acp` doesn't
- * hold one persistent connection the way `bridged` does), so reusing this
- * one would leave it either idle forever or racing the first real session's
- * dial.
+ * The dial-then-persist tail shared by `connectRemoteAcpAgent` (manual
+ * endpoint+API-key paste, task #13) and `connectOAuthRemoteAcpAgent` (Buda
+ * OAuth connect, PUL-335): dial the endpoint with whatever bearer credential
+ * the caller resolved, run the real `initialize` handshake, encrypt that
+ * credential's SERIALIZED payload (a plain API key string for one caller, a
+ * JSON-encoded `{accessToken, refreshToken, agentId}` blob for the other —
+ * `encryptAgentApiKey` only cares that it's a string), and persist both rows
+ * in one transaction. Pulled out once a second real caller needed the exact
+ * same transaction shape — not a speculative abstraction, both call sites
+ * already existed before this was factored out.
  */
-export async function connectRemoteAcpAgent(
+async function dialAndPersistRemoteAcpAgent(
   db: Database,
-  input: ConnectRemoteAcpAgentInput,
+  input: {
+    label: string;
+    endpoint: string;
+    bearerToken: string;
+    credentialKind: AgentCredentialKind;
+    credentialPayload: string;
+    credentialExpiresAt: Date | null;
+  },
 ): Promise<AgentVO> {
-  const socket = await dialRemoteAcpSocket(input.endpoint, input.apiKey);
+  const socket = await dialRemoteAcpSocket(input.endpoint, input.bearerToken);
   const connection = acp.client({ name: "acprouter" }).connect(streamFromWebSocket(socket));
   const initializeResult = await performAcpInitializeHandshake(connection, socket, input.endpoint);
   connection.close();
@@ -159,7 +163,7 @@ export async function connectRemoteAcpAgent(
   // `agent-credential-crypto.ts` bubble up unformatted.
   let encryptedPayload: string;
   try {
-    encryptedPayload = encryptAgentApiKey(input.apiKey);
+    encryptedPayload = encryptAgentApiKey(input.credentialPayload);
   } catch (error) {
     throw new ORPCError("INTERNAL_SERVER_ERROR", {
       message: error instanceof Error ? error.message : "Could not encrypt the agent credential.",
@@ -198,8 +202,9 @@ export async function connectRemoteAcpAgent(
     await tx.insert(acprouterAgentCredentials).values({
       id: credentialId,
       agentId,
-      kind: "remote_api_key",
+      kind: input.credentialKind,
       encryptedPayload,
+      expiresAt: input.credentialExpiresAt,
     });
   });
 
@@ -210,4 +215,88 @@ export async function connectRemoteAcpAgent(
     });
   }
   return toAgentVO(row);
+}
+
+/**
+ * Story B / spec §2b's Buda Add flow: "Submit connects immediately — there
+ * is no detection step because there is no process to detect." Validates
+ * the endpoint+key for REAL before persisting anything — a real dial and a
+ * real `initialize`, not a format check — so a card never goes green over a
+ * credential this Router never actually proved works (spec §3's "silent
+ * auto-approval"-adjacent failure mode, applied to enrollment itself).
+ *
+ * The socket opened here is a THROWAWAY PROBE, not the connection a later
+ * prompt-box session uses: `sessions-logic.ts#startAgentSession` dials its
+ * own fresh connection per session (spec §11 point 6 / this domain's
+ * `remote-session-registry.ts` doc comment explain why `remote-acp` doesn't
+ * hold one persistent connection the way `bridged` does), so reusing this
+ * one would leave it either idle forever or racing the first real session's
+ * dial.
+ */
+export async function connectRemoteAcpAgent(
+  db: Database,
+  input: ConnectRemoteAcpAgentInput,
+): Promise<AgentVO> {
+  return dialAndPersistRemoteAcpAgent(db, {
+    label: input.label,
+    endpoint: input.endpoint,
+    bearerToken: input.apiKey,
+    credentialKind: "remote_api_key",
+    credentialPayload: input.apiKey,
+    credentialExpiresAt: null,
+  });
+}
+
+/** Resolves Buda's public origin for both the OAuth authorize/token endpoints and the ACP WebSocket URL — same env var name as `packages/busabase-core/src/domains/agents/logic/buda-connection.ts#getBudaOAuthOrigin`, deliberately: one value can serve both apps in a shared deployment, and acprouter-core should not import the whole busabase-core package just for this one-liner (wrong direction of coupling between two independent domains). */
+export function getBudaOAuthOrigin(): string {
+  return new URL(process.env.BUDA_OAUTH_ORIGIN?.trim() || "https://buda.im").origin;
+}
+
+/** The `remote-acp` ACP WebSocket endpoint for a given Buda `agentId`, same shape `connectOAuthRemoteAcpAgent` persists into `acprouter_agents.endpoint` as the manual Add flow does for a pasted Buda URL. */
+function getBudaAcpEndpoint(agentId: string): string {
+  const url = new URL("/api/acp", getBudaOAuthOrigin());
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  url.searchParams.set("agentId", agentId);
+  return url.toString();
+}
+
+export interface ConnectOAuthRemoteAcpAgentInput {
+  label: string;
+  agentId: string;
+  accessToken: string;
+  refreshToken: string;
+  expiresAt: Date;
+}
+
+/**
+ * OAuth counterpart to `connectRemoteAcpAgent`: instead of a
+ * user-pasted endpoint + API key, the caller already completed the Buda
+ * OAuth authorization-code exchange in its callback route and hands this
+ * function the resulting token set. Builds the same `wss://.../api/acp?agentId=` endpoint
+ * the manual flow's dialog pre-fills, dials it with the OAuth access token
+ * as the bearer credential (Buda's ACP WebSocket route accepts any valid
+ * bearer, OAuth-issued or API-key — same `Authorization: Bearer` contract,
+ * confirmed against `remote-agents-logic.integration.test.ts`'s fixture),
+ * and persists a `kind: "oauth"` credential row (`schema/agent-credentials
+ * .ts`'s `AgentCredentialKind` already listed this kind before this task
+ * ever inserted one) with `expiresAt` set — unlike `remote_api_key`, this
+ * credential genuinely expires and carries a refresh token for later.
+ */
+export async function connectOAuthRemoteAcpAgent(
+  db: Database,
+  input: ConnectOAuthRemoteAcpAgentInput,
+): Promise<AgentVO> {
+  const credential: StoredOAuthCredential = {
+    accessToken: input.accessToken,
+    refreshToken: input.refreshToken,
+    agentId: input.agentId,
+  };
+  return dialAndPersistRemoteAcpAgent(db, {
+    label: input.label,
+    endpoint: getBudaAcpEndpoint(input.agentId),
+    bearerToken: input.accessToken,
+    credentialKind: "oauth",
+    credentialPayload: JSON.stringify(credential),
+    credentialExpiresAt: input.expiresAt,
+  });
 }

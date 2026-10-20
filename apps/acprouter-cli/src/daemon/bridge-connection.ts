@@ -16,14 +16,36 @@ import { startWebSocketKeepalive } from "@acprouter/core/ws-keepalive";
 import { WebSocket } from "ws";
 import type { AuthStatus } from "../config";
 import { createBridgeAgentApp } from "./bridge-agent";
-import { toBridgeWebSocketUrl } from "./bridge-url";
+import { toBridgeWebSocketHeaders, toBridgeWebSocketUrl } from "./bridge-url";
 
 const INITIAL_BACKOFF_MS = 1000;
 const MAX_BACKOFF_MS = 30_000;
+/** Reconnecting a connection that was genuinely open (not a cold start) gets this floor instead of the full backoff — a transient blip on an already-healthy link shouldn't wait as long as "can't reach the Router at all". */
+const FAST_RECONNECT_MS = 500;
+/** ±20% randomization on every computed delay, so many bridges that all dropped at once (a Router restart) don't all retry in lockstep. */
+const RECONNECT_JITTER = 0.2;
+
+/**
+ * Pure delay math, factored out of `scheduleReconnect` so it's directly unit
+ * testable without spinning up a real WebSocket — same split
+ * `apps/buda-connector/src/relay.ts`'s `getConnectorRelayReconnectBaseDelay`
+ * makes, for the same reason.
+ */
+export function computeReconnectDelay(hadOpenConnection: boolean, backoffMs: number): number {
+  const base = hadOpenConnection ? FAST_RECONNECT_MS : backoffMs;
+  const jitter = base * RECONNECT_JITTER * (Math.random() * 2 - 1);
+  return Math.max(hadOpenConnection ? 250 : 500, Math.round(base + jitter));
+}
+
+export function nextBackoffMs(hadOpenConnection: boolean, backoffMs: number): number {
+  return hadOpenConnection ? INITIAL_BACKOFF_MS : Math.min(backoffMs * 2, MAX_BACKOFF_MS);
+}
 
 export interface BridgeConnectionHandle {
   /** Stops reconnecting and closes whatever is currently open. Resolves once the socket is closed. */
   stop(): Promise<void>;
+  /** Whether the ACP handshake is currently attached to a live socket — diagnostic only, read by `runner.ts`'s heartbeat writer. */
+  isConnected(): boolean;
 }
 
 export interface BridgeConnectionConfig {
@@ -33,6 +55,8 @@ export interface BridgeConnectionConfig {
   /** Forwarded to `createBridgeAgentApp` so every `initialize` response can report them (task #10). */
   intendedAgentSlug: string | null;
   authStatus?: AuthStatus | null;
+  /** Sent as an `Authorization: Bearer` header on the WS upgrade (task #6.4) — never appended to `url`. */
+  bridgeCredential?: string;
 }
 
 /**
@@ -54,6 +78,7 @@ export function startBridgeConnection(
   log: (line: string) => void,
 ): BridgeConnectionHandle {
   const url = toBridgeWebSocketUrl(config.server, config.machineId);
+  const headers = toBridgeWebSocketHeaders(config.bridgeCredential);
   const bridgeAgent = createBridgeAgentApp({
     dir: config.dir,
     registrySlug: config.intendedAgentSlug,
@@ -68,10 +93,18 @@ export function startBridgeConnection(
   let connectionAttached = false;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
-  const scheduleReconnect = (reason: string) => {
+  /**
+   * `hadOpenConnection` distinguishes "this attempt never even reached the
+   * ACP handshake" (the Router is genuinely unreachable — keep backing off)
+   * from "we were connected and it just dropped" (a laptop sleep/wake, a
+   * momentary network blip on an otherwise-healthy link — retry fast, and
+   * reset the backoff ladder back to the start since nothing here suggests
+   * the Router itself is a lost cause).
+   */
+  const scheduleReconnect = (reason: string, hadOpenConnection: boolean) => {
     if (stopped) return;
-    const delay = backoffMs;
-    backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF_MS);
+    const delay = computeReconnectDelay(hadOpenConnection, backoffMs);
+    backoffMs = nextBackoffMs(hadOpenConnection, backoffMs);
     log(`bridge disconnected (${reason}); reconnecting in ${delay}ms`);
     reconnectTimer = setTimeout(connect, delay);
   };
@@ -80,7 +113,7 @@ export function startBridgeConnection(
     if (stopped) return;
     log(`bridge connecting to ${url}`);
     connectionAttached = false;
-    const socket = new WebSocket(url);
+    const socket = new WebSocket(url, headers ? { headers } : undefined);
     currentSocket = socket;
 
     // Wiring MUST happen synchronously inside the "open" listener, with no
@@ -107,7 +140,7 @@ export function startBridgeConnection(
         .finally(() => {
           stopKeepalive();
           if (currentSocket === socket) currentSocket = null;
-          scheduleReconnect("acp connection closed");
+          scheduleReconnect("acp connection closed", true);
         });
     });
 
@@ -127,7 +160,7 @@ export function startBridgeConnection(
         // `connection.closed` handler above never got wired, so nothing else
         // will schedule a retry.
         const reason = reasonBuf.toString("utf8");
-        scheduleReconnect(`socket closed (${code}${reason ? ` ${reason}` : ""})`);
+        scheduleReconnect(`socket closed (${code}${reason ? ` ${reason}` : ""})`, false);
       }
     });
   }
@@ -145,6 +178,9 @@ export function startBridgeConnection(
         socket.once("close", () => resolve());
         socket.close(1000, "bridge shutting down");
       });
+    },
+    isConnected() {
+      return connectionAttached;
     },
   };
 }

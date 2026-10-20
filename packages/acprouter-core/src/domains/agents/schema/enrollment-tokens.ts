@@ -1,4 +1,5 @@
 import { pgTable, text, timestamp, uniqueIndex } from "drizzle-orm/pg-core";
+import { acprouterRouterEnrollmentGrants } from "./router-enrollment-grants";
 
 /**
  * Single-use, short-TTL tokens the "Add" dialog mints and the CLI redeems
@@ -17,6 +18,16 @@ export const acprouterEnrollmentTokens = pgTable(
     intendedAgentSlug: text("intended_agent_slug"),
     expiresAt: timestamp("expires_at", { mode: "date" }).notNull(),
     usedAt: timestamp("used_at", { mode: "date" }),
+    /**
+     * Set only by the new OAuth-bearer-authenticated mint procedure (Task
+     * 4.2), null for every pre-existing/legacy-minted token. This is the
+     * STORED, trusted signal `redeemEnrollmentToken` dispatches on to choose
+     * the transactional `oauth-enrollment` branch vs. the legacy two-statement
+     * branch — never a caller-supplied flag (design.md: "Cloud redeem handler
+     * dispatches by trusted stored token kind; never by a CLI-supplied legacy
+     * flag").
+     */
+    grantId: text("grant_id").references(() => acprouterRouterEnrollmentGrants.id),
     createdAt: timestamp("created_at", { mode: "date" }).defaultNow().notNull(),
   },
   (table) => [uniqueIndex("acprouter_enrollment_tokens_hash_idx").on(table.tokenHash)],

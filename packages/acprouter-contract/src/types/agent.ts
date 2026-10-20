@@ -35,3 +35,21 @@ export const ConnectRemoteAcpAgentInputSchema = z.object({
   apiKey: z.string().min(1),
 });
 export type ConnectRemoteAcpAgentInput = z.infer<typeof ConnectRemoteAcpAgentInputSchema>;
+
+/**
+ * Soft-removes one of the caller's own agent rows (eligible only when
+ * `status` is `"disconnected"` — `connected`, `auth_required`, and `error`
+ * are all rejected). Shape mirrors `RevokeConsumerApiKeyInputSchema`/
+ * `RevokeConsumerApiKeyOutputSchema` (`types/consumer-api-key.ts`) exactly —
+ * the dashboard only needs a yes/no result to know whether to refresh its
+ * list, not the removed row's content.
+ */
+export const RemoveAgentInputSchema = z.object({
+  id: z.string(),
+});
+export type RemoveAgentInput = z.infer<typeof RemoveAgentInputSchema>;
+
+export const RemoveAgentOutputSchema = z.object({
+  ok: z.boolean(),
+});
+export type RemoveAgentOutput = z.infer<typeof RemoveAgentOutputSchema>;

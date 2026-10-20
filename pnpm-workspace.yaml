@@ -1,9 +1,13 @@
 packages:
   - apps/*
   - packages/*
+  - packages/@acp-ui/*
 
 nodeLinker: hoisted
 
 onlyBuiltDependencies:
   - esbuild
   - unrs-resolver
+
+patchedDependencies:
+  'next-ws@2.2.12': patches/next-ws@2.2.12.patch

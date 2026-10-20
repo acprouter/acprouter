@@ -128,6 +128,21 @@ curl -i -u "$CADDY_BASIC_AUTH_USER:<your plaintext password>" http://localhost:1
 curl http://localhost:15420/
 ```
 
+When Cloudflare Tunnel or another reverse proxy publishes the Router on a real
+domain, set the public origin on the running container:
+
+```bash
+ACPROUTER_PUBLIC_URL=https://acprouter-demo.bika.ltd
+```
+
+The value is read at container startup, so the same already-built image can be
+deployed under different domains. It controls the address copied from
+**Agents → Add** and consumer WebSocket URLs. Keep `HOSTNAME=0.0.0.0`: that is
+the internal listener, not the public address. `NEXT_PUBLIC_APP_URL` is also
+accepted for compatibility, but `ACPROUTER_PUBLIC_URL` takes precedence when
+both are set. The value must be an HTTP(S) origin without a path, query, or
+fragment.
+
 ### Why `127.0.0.1` binding is the bare-metal answer but *not* the Docker one
 
 `package.json`'s `start` script hardcodes `next start -H 127.0.0.1` — that's real and correct for a
@@ -161,6 +176,8 @@ is the reference to translate from.
 | Variable | Default | What it does |
 |---|---|---|
 | `PG_DATABASE_URL` | `pglite://.data/acprouter` | Set to a real `postgres://…` URL to use a real Postgres instead of the embedded dev database. |
+| `ACPROUTER_PUBLIC_URL` | Request origin | Runtime public HTTP(S) origin embedded in Agent connect commands and consumer WebSocket URLs. |
+| `NEXT_PUBLIC_APP_URL` | unset | Compatibility fallback for `ACPROUTER_PUBLIC_URL`. Also read at runtime by the server route. |
 | `ACPROUTER_TRUST_REVERSE_PROXY` | unset | Set to exactly `true` once a real reverse proxy or private network is in front of this instance, to suppress the exposure banner. |
 | `PORT` | `15420` | Port the server listens on. |
 

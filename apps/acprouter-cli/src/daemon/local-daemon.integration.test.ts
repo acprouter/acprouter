@@ -1,12 +1,12 @@
 import type { ChildProcessByStdio } from "node:child_process";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { configFilePath, pidFilePath } from "../config";
+import { configFilePath, heartbeatFilePath, pidFilePath } from "../config";
 
 /**
  * Exercises the real CLI as a subprocess against a scratch home directory —
@@ -186,6 +186,30 @@ describe("acprouter-cli daemon lifecycle", () => {
     expect(healedResult.action).toBe("self_healed");
     expect(healedResult.pid).not.toBe(firstPid);
     expect(healedResult.server).toBe(fakeRouter.url);
+  });
+
+  it("a live process with a stale heartbeat is reported as unresponsive, not running", () => {
+    const connect = runCli(["connect", "--server", fakeRouter.url, "--token", "tok_test"], home);
+    const pid = (readJson(connect.stdout) as { pid: number }).pid;
+    expect(existsSync(heartbeatFilePath(home))).toBe(true);
+
+    // Simulate a hung event loop: the PID is still alive, but its heartbeat
+    // stopped ticking well past `HEARTBEAT_STALE_MS` ago — this is the exact
+    // scenario a bare signal-0 liveness probe cannot distinguish from
+    // "running fine", which is the whole reason `unresponsive` exists.
+    writeFileSync(
+      heartbeatFilePath(home),
+      JSON.stringify({
+        pid,
+        updatedAt: new Date(Date.now() - 10 * 60_000).toISOString(),
+        connected: true,
+      }),
+    );
+
+    const status = runCli(["status"], home);
+    const statusResult = readJson(status.stdout) as { status: string; pid: number };
+    expect(statusResult.status).toBe("unresponsive");
+    expect(statusResult.pid).toBe(pid);
   });
 
   it("restart replaces the running process with a new PID", () => {

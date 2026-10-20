@@ -6,6 +6,7 @@ import {
   GetPromptRequestSchema,
   ListPromptsRequestSchema,
   ListResourcesRequestSchema,
+  ListResourceTemplatesRequestSchema,
   ListToolsRequestSchema,
   ReadResourceRequestSchema,
   type Tool,
@@ -22,6 +23,13 @@ type CallToolResult = {
 
 export type McpToolExtra = {
   authInfo?: AuthInfo;
+  /**
+   * The HTTP request the MCP message arrived on (headers only), as the SDK's
+   * streamable-HTTP transport passes it. Lets a host read a routing header — a
+   * workspace selector, say — on calls that have no arguments to carry one, such
+   * as `prompts/list`.
+   */
+  requestInfo?: { headers: Record<string, string | string[] | undefined> };
 };
 
 export type McpInputSchema = AnySchema;
@@ -111,65 +119,193 @@ export interface McpPromptDefinition {
 
 const DEFAULT_MCP_RESOURCE_MIME_TYPE = "text/markdown";
 
+/** One entry a dynamic provider contributes to `prompts/list`. */
+export interface McpPromptListing {
+  name: string;
+  title?: string;
+  description?: string;
+  arguments?: McpPromptArgumentDefinition[];
+}
+
+/** One entry a dynamic provider contributes to `resources/list`. */
+export interface McpResourceListing {
+  uri: string;
+  name: string;
+  title?: string;
+  description?: string;
+  /** Defaults to `text/markdown`. */
+  mimeType?: string;
+}
+
+/** An RFC 6570 URI template published over `resources/templates/list`. */
+export interface McpResourceTemplateListing {
+  uriTemplate: string;
+  name: string;
+  title?: string;
+  description?: string;
+  mimeType?: string;
+}
+
+/**
+ * Prompts and resources whose set depends on WHO is asking — the documents stored in
+ * the caller's workspace, say — rather than being fixed when the handler is built.
+ *
+ * Every hook receives the same `extra` tool calls do (`authInfo`, `requestInfo`) and
+ * runs inside the same request scope, so a host resolves the caller exactly as it does
+ * for a tool call. Static `prompts`/`resources` are always served first and win a name
+ * or URI collision; a dynamic entry that collides is dropped from the listing.
+ *
+ * `getPrompt`/`readResource` return `undefined` for a name/URI they do not own, which
+ * surfaces to the client as the ordinary "not found" error. A listing hook that throws
+ * is logged and contributes nothing — the static documents are still listed, because a
+ * broken workspace lookup must not take the server's own manual down with it.
+ */
+export interface McpDocumentProviders {
+  listPrompts?: (extra: McpToolExtra) => Promise<readonly McpPromptListing[]>;
+  getPrompt?: (
+    name: string,
+    args: Record<string, string>,
+    extra: McpToolExtra,
+  ) => Promise<{ description?: string; text: string } | undefined>;
+  listResources?: (extra: McpToolExtra) => Promise<readonly McpResourceListing[]>;
+  listResourceTemplates?: (extra: McpToolExtra) => Promise<readonly McpResourceTemplateListing[]>;
+  readResource?: (
+    uri: string,
+    extra: McpToolExtra,
+  ) => Promise<{ text: string; mimeType?: string } | undefined>;
+}
+
+const hasDynamicPrompts = (providers: McpDocumentProviders | undefined) =>
+  Boolean(providers?.listPrompts || providers?.getPrompt);
+
+const hasDynamicResources = (providers: McpDocumentProviders | undefined) =>
+  Boolean(providers?.listResources || providers?.listResourceTemplates || providers?.readResource);
+
+const listDynamic = async <T>(
+  kind: string,
+  list: ((extra: McpToolExtra) => Promise<readonly T[]>) | undefined,
+  extra: McpToolExtra,
+): Promise<readonly T[]> => {
+  if (!list) return [];
+  try {
+    return await list(extra);
+  } catch (error) {
+    console.error(`[mcp] Dynamic ${kind} listing failed:`, error);
+    return [];
+  }
+};
+
 /**
  * Register `resources/*` and `prompts/*` handlers. Both are opt-in: a server that
- * passes neither keeps exactly the tools-only capability set it had before.
+ * passes neither (and no `providers`) keeps exactly the tools-only capability set it
+ * had before.
  */
 export const registerMcpDocuments = (options: {
   server: McpServerLike;
   resources?: readonly McpResourceDefinition[];
   prompts?: readonly McpPromptDefinition[];
+  providers?: McpDocumentProviders;
 }) => {
   const resources = options.resources ?? [];
   const prompts = options.prompts ?? [];
+  const providers = options.providers;
 
-  if (resources.length) {
+  if (resources.length || hasDynamicResources(providers)) {
     const byUri = new Map(resources.map((resource) => [resource.uri, resource]));
-    options.server.setRequestHandler(ListResourcesRequestSchema, async () => ({
-      resources: resources.map(({ uri, name, title, description, mimeType }) => ({
-        uri,
-        name,
-        ...(title ? { title } : {}),
-        ...(description ? { description } : {}),
-        mimeType: mimeType ?? DEFAULT_MCP_RESOURCE_MIME_TYPE,
-      })),
-    }));
+    options.server.setRequestHandler(ListResourcesRequestSchema, async (_request, extra) => {
+      const dynamic = await listDynamic(
+        "resource",
+        providers?.listResources,
+        extra as McpToolExtra,
+      );
+      return {
+        resources: [...resources, ...dynamic.filter((resource) => !byUri.has(resource.uri))].map(
+          ({ uri, name, title, description, mimeType }) => ({
+            uri,
+            name,
+            ...(title ? { title } : {}),
+            ...(description ? { description } : {}),
+            mimeType: mimeType ?? DEFAULT_MCP_RESOURCE_MIME_TYPE,
+          }),
+        ),
+      };
+    });
+    if (providers?.listResourceTemplates) {
+      const listTemplates = providers.listResourceTemplates;
+      options.server.setRequestHandler(
+        ListResourceTemplatesRequestSchema,
+        async (_request, extra) => ({
+          resourceTemplates: (
+            await listDynamic("resource template", listTemplates, extra as McpToolExtra)
+          ).map(({ uriTemplate, name, title, description, mimeType }) => ({
+            uriTemplate,
+            name,
+            ...(title ? { title } : {}),
+            ...(description ? { description } : {}),
+            mimeType: mimeType ?? DEFAULT_MCP_RESOURCE_MIME_TYPE,
+          })),
+        }),
+      );
+    }
     options.server.setRequestHandler(ReadResourceRequestSchema, async (request, extra) => {
-      const resource = byUri.get(request.params.uri);
-      if (!resource) {
-        throw new Error(`MCP resource not found: ${request.params.uri}`);
+      const uri = request.params.uri;
+      const resource = byUri.get(uri);
+      if (resource) {
+        return {
+          contents: [
+            {
+              uri: resource.uri,
+              mimeType: resource.mimeType ?? DEFAULT_MCP_RESOURCE_MIME_TYPE,
+              text: await resource.read(extra as McpToolExtra),
+            },
+          ],
+        };
+      }
+      const dynamic = await providers?.readResource?.(uri, extra as McpToolExtra);
+      if (!dynamic) {
+        throw new Error(`MCP resource not found: ${uri}`);
       }
       return {
         contents: [
-          {
-            uri: resource.uri,
-            mimeType: resource.mimeType ?? DEFAULT_MCP_RESOURCE_MIME_TYPE,
-            text: await resource.read(extra as McpToolExtra),
-          },
+          { uri, mimeType: dynamic.mimeType ?? DEFAULT_MCP_RESOURCE_MIME_TYPE, text: dynamic.text },
         ],
       };
     });
   }
 
-  if (prompts.length) {
+  if (prompts.length || hasDynamicPrompts(providers)) {
     const byName = new Map(prompts.map((prompt) => [prompt.name, prompt]));
-    options.server.setRequestHandler(ListPromptsRequestSchema, async () => ({
-      prompts: prompts.map(({ name, title, description, arguments: args }) => ({
-        name,
-        ...(title ? { title } : {}),
-        ...(description ? { description } : {}),
-        ...(args?.length ? { arguments: args } : {}),
-      })),
-    }));
-    options.server.setRequestHandler(GetPromptRequestSchema, async (request, extra) => {
-      const prompt = byName.get(request.params.name);
-      if (!prompt) {
-        throw new Error(`MCP prompt not found: ${request.params.name}`);
-      }
-      const text = await prompt.get(request.params.arguments ?? {}, extra as McpToolExtra);
+    options.server.setRequestHandler(ListPromptsRequestSchema, async (_request, extra) => {
+      const dynamic = await listDynamic("prompt", providers?.listPrompts, extra as McpToolExtra);
       return {
-        ...(prompt.description ? { description: prompt.description } : {}),
-        messages: [{ role: "user" as const, content: { type: "text" as const, text } }],
+        prompts: [...prompts, ...dynamic.filter((prompt) => !byName.has(prompt.name))].map(
+          ({ name, title, description, arguments: args }) => ({
+            name,
+            ...(title ? { title } : {}),
+            ...(description ? { description } : {}),
+            ...(args?.length ? { arguments: args } : {}),
+          }),
+        ),
+      };
+    });
+    options.server.setRequestHandler(GetPromptRequestSchema, async (request, extra) => {
+      const name = request.params.name;
+      const args = request.params.arguments ?? {};
+      const prompt = byName.get(name);
+      const resolved = prompt
+        ? {
+            description: prompt.description,
+            text: await prompt.get(args, extra as McpToolExtra),
+          }
+        : await providers?.getPrompt?.(name, args, extra as McpToolExtra);
+      if (!resolved) {
+        throw new Error(`MCP prompt not found: ${name}`);
+      }
+      return {
+        ...(resolved.description ? { description: resolved.description } : {}),
+        messages: [
+          { role: "user" as const, content: { type: "text" as const, text: resolved.text } },
+        ],
       };
     });
   }
@@ -200,6 +336,14 @@ export interface RegisterOpenApiMcpToolsOptions<TClient>
   name?: (keyPath: string[], procedure: OpenApiProcedure) => string;
   additionalTools?: readonly McpCustomTool<TClient>[];
   additionalToolsInputSchema?: McpInputSchema;
+  /**
+   * Tool names to list FIRST in `tools/list`, in this order (custom and
+   * contract-derived tools alike). Every other tool keeps its default place:
+   * custom tools, then contract tools in contract key order. Names that match
+   * no tool are ignored. Order only — the set of tools never changes. Clients
+   * that truncate or skim a long tool list see these first.
+   */
+  priorityToolNames?: readonly string[];
 }
 
 /**
@@ -240,24 +384,28 @@ export interface CreateOpenApiMcpHandlerOptions<TClient>
   additionalTools?: readonly McpCustomTool<TClient>[];
   /** Merged into every custom tool's schema, mirroring `additionalInputSchema`. */
   additionalToolsInputSchema?: McpInputSchema;
+  /**
+   * Tool names to list FIRST in `tools/list`, in this order (custom and
+   * contract-derived tools alike). Every other tool keeps its default place:
+   * custom tools, then contract tools in contract key order. Names that match
+   * no tool are ignored. Order only — the set of tools never changes. Clients
+   * that truncate or skim a long tool list see these first.
+   */
+  priorityToolNames?: readonly string[];
   /** Opt-in `prompts/*` surface. Omit to keep the tools-only capability set. */
   prompts?: readonly McpPromptDefinition[];
   /** Opt-in `resources/*` surface. Omit to keep the tools-only capability set. */
   resources?: readonly McpResourceDefinition[];
+  /**
+   * Opt-in per-caller prompts/resources, merged after the static ones. Supplying any
+   * hook declares the matching capability even when the static list is empty.
+   */
+  documentProviders?: McpDocumentProviders;
   serverInfo?: {
     name: string;
     version: string;
   };
 }
-
-type McpSession = {
-  server: Server;
-  transport: WebStandardStreamableHTTPServerTransport;
-};
-
-type PendingMcpSession = McpSession & {
-  getSessionId: () => string;
-};
 
 const quoteAuthParam = (value: string) => `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 
@@ -320,6 +468,24 @@ export const createMcpToolsFromOpenApiContract = <TClient>(
       return operation(input);
     },
   }));
+};
+
+/**
+ * Move `priorityNames` (in that order) to the front of `tools`; everything else
+ * keeps its relative order. Never adds or drops a tool.
+ */
+export const orderMcpTools = <T extends { name: string }>(
+  tools: readonly T[],
+  priorityNames: readonly string[] | undefined,
+): T[] => {
+  if (!priorityNames || priorityNames.length === 0) return [...tools];
+  const byName = new Map(tools.map((tool) => [tool.name, tool]));
+  const first = [...new Set(priorityNames)].flatMap((name) => {
+    const tool = byName.get(name);
+    return tool ? [tool] : [];
+  });
+  const promoted = new Set(first.map((tool) => tool.name));
+  return [...first, ...tools.filter((tool) => !promoted.has(tool.name))];
 };
 
 export const registerOpenApiMcpTools = <TClient>(
@@ -420,12 +586,14 @@ export const registerOpenApiMcpTools = <TClient>(
     }),
   );
 
-  options.server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: [
+  const listedTools = orderMcpTools(
+    [
       ...[...customTools.values()].map(({ definition }) => definition),
       ...[...tools.values()].map(({ definition }) => definition),
     ],
-  }));
+    options.priorityToolNames,
+  );
+  options.server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: listedTools }));
   options.server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     try {
       const custom = customTools.get(request.params.name);
@@ -638,20 +806,23 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 export const createOpenApiMcpHandler = <TClient>(
   options: CreateOpenApiMcpHandlerOptions<TClient>,
 ): McpRouteHandler => {
-  const sessions = new Map<string, McpSession>();
-
-  const createSession = async () => {
+  const createRequestHandler = async () => {
     const server = new Server(options.serverInfo ?? { name: "OpenAPI MCP", version: "0.1.0" }, {
       capabilities: {
         tools: {},
-        ...(options.resources?.length ? { resources: {} } : {}),
-        ...(options.prompts?.length ? { prompts: {} } : {}),
+        ...(options.resources?.length || hasDynamicResources(options.documentProviders)
+          ? { resources: {} }
+          : {}),
+        ...(options.prompts?.length || hasDynamicPrompts(options.documentProviders)
+          ? { prompts: {} }
+          : {}),
       },
       instructions: options.instructions,
     });
     registerMcpDocuments({
       server,
       prompts: options.prompts,
+      providers: options.documentProviders,
       resources: options.resources,
     });
     registerOpenApiMcpTools({
@@ -666,27 +837,25 @@ export const createOpenApiMcpHandler = <TClient>(
       exclude: options.exclude,
       include: options.include,
       name: options.name,
+      priorityToolNames: options.priorityToolNames,
       securitySchemes: options.securitySchemes,
     });
 
-    let sessionId = "";
     const transport = new WebStandardStreamableHTTPServerTransport({
       enableJsonResponse: true,
-      sessionIdGenerator: () => crypto.randomUUID(),
-      onsessioninitialized: (id) => {
-        sessionId = id;
-        sessions.set(id, { server, transport });
-      },
-      onsessionclosed: (id) => {
-        sessions.delete(id);
-      },
+      // This handler only returns complete JSON responses and does not expose a
+      // long-lived GET/SSE channel, so keeping protocol sessions in process
+      // adds no capability. Stateless mode also lets clients survive dev HMR,
+      // process restarts, and serverless requests even when they keep sending
+      // an old Mcp-Session-Id header from a previous server instance.
+      sessionIdGenerator: undefined,
     });
     transport.onerror = (error) => {
       console.error("[mcp] Transport error:", error);
     };
 
     await server.connect(transport);
-    return { server, transport, getSessionId: () => sessionId };
+    return transport;
   };
 
   return async (request) => {
@@ -701,30 +870,16 @@ export const createOpenApiMcpHandler = <TClient>(
       );
     }
 
-    const sessionId = request.headers.get("mcp-session-id");
-    const session = sessionId ? sessions.get(sessionId) : undefined;
-    const activeSession = session ?? (await createSession());
+    const transport = await createRequestHandler();
     const requestWithAuth = request as Request & {
       auth?: McpToolExtra["authInfo"];
       authInfo?: McpToolExtra["authInfo"];
     };
-    const response = await activeSession.transport.handleRequest(request, {
+    return transport.handleRequest(request, {
       authInfo: requestWithAuth.authInfo ?? requestWithAuth.auth,
     });
-
-    const initializedSessionId = isPendingSession(activeSession)
-      ? activeSession.getSessionId()
-      : undefined;
-    if (initializedSessionId && !response.headers.has("mcp-session-id")) {
-      response.headers.set("mcp-session-id", initializedSessionId);
-    }
-
-    return response;
   };
 };
-
-const isPendingSession = (session: McpSession | PendingMcpSession): session is PendingMcpSession =>
-  "getSessionId" in session;
 
 const discoverOpenApiTools = (
   contract: unknown,

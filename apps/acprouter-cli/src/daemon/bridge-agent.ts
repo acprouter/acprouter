@@ -1,5 +1,5 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
-import type { BridgeInitializeMeta } from "@acprouter/contract";
+import type { BridgeInitializeMeta, BridgeSessionMeta } from "@acprouter/contract";
 import * as acp from "@agentclientprotocol/sdk";
 import type { AuthStatus } from "../config";
 import { detectAgent } from "../detect";
@@ -191,7 +191,22 @@ export function createBridgeAgentApp(deps: BridgeAgentDeps): BridgeAgentHandle {
       // `_meta` are the spawned agent's real negotiated capabilities (spec
       // §5.2a: "capabilities must be negotiated from `initialize`, never
       // assumed"), and the Router has no other way to learn them.
-      return newSession;
+      //
+      // `promptCapabilities` has to be added on top rather than being part of
+      // `newSession` already: it comes from the spawned agent's `initialize`,
+      // not its `session/new`. Without it the Router cannot tell whether THIS
+      // session's agent accepts images, audio or embedded resources — the
+      // bridge's own `initialize` reports only what the CLI implements, and
+      // the agent behind it does not even exist until this handler runs.
+      // Spread so an agent's own `session/new` `_meta` is preserved, not
+      // replaced.
+      return {
+        ...newSession,
+        _meta: {
+          ...(newSession._meta ?? {}),
+          promptCapabilities: spawned.initializeResult.agentCapabilities?.promptCapabilities ?? {},
+        } satisfies BridgeSessionMeta & Record<string, unknown>,
+      };
     })
     .onRequest(acp.methods.agent.session.prompt, async (ctx) => {
       const session = sessions.get(ctx.params.sessionId);
