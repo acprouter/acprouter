@@ -1,7 +1,7 @@
 {
   "name": "@acprouter/server",
   "description": "ACP Router — open-source, self-hostable gateway that local ACP agents dial out to.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": false,
   "license": "MIT",
   "publishConfig": {

@@ -1,7 +1,8 @@
 import type { AgentSessionStreamEventVO } from "@acprouter/contract";
 import type * as acp from "@agentclientprotocol/sdk";
+import { ORPCError } from "@orpc/server";
 import type { Database } from "../../../db";
-import { appendSessionEvent } from "./session-events-logic";
+import { appendSessionEvent, getSessionEventMaxSeq } from "./session-events-logic";
 import { markSessionFailed, markSessionIdle } from "./session-status-logic";
 
 /**
@@ -168,72 +169,86 @@ function pruneIfEmpty(sessionId: string): void {
   }
 }
 
-type GlobalWithSessionEventSeqs = typeof globalThis & {
-  __acprouterSessionEventSeqs?: Map<string, number>;
+interface SessionPersistence {
+  seq: number | null;
+  pending: Promise<void>;
+  error?: unknown;
+}
+
+type GlobalWithSessionPersistence = typeof globalThis & {
+  __acprouterSessionPersistence?: Map<string, SessionPersistence>;
+  __acprouterSessionHistoryReplay?: Set<string>;
 };
 
-/**
- * Deliberately a SEPARATE map from `getRegistry()`'s relay map, not a field
- * on `SessionRelay` — that object is pruned the instant nobody is watching
- * AND no permission is pending (`pruneIfEmpty`), which happens after every
- * single turn once the browser's `for await` loop returns. But one session's
- * event log spans MANY turns (`sessions.prompt` is called once per user
- * message, re-attaching `watchSession` each time) — a counter stored on the
- * pruned relay object would silently reset to 0 on the very next turn and
- * collide with the unique `(sessionId, seq)` index. This map survives that
- * pruning; it is cleared only in `clearSeq`, once a session truly ends.
- */
-function getSeqCounters(): Map<string, number> {
-  const g = globalThis as GlobalWithSessionEventSeqs;
-  if (!g.__acprouterSessionEventSeqs) {
-    g.__acprouterSessionEventSeqs = new Map();
+function getPersistenceRegistry(): Map<string, SessionPersistence> {
+  const g = globalThis as GlobalWithSessionPersistence;
+  g.__acprouterSessionPersistence ??= new Map();
+  return g.__acprouterSessionPersistence;
+}
+
+function getHistoryReplays(): Set<string> {
+  const g = globalThis as GlobalWithSessionPersistence;
+  g.__acprouterSessionHistoryReplay ??= new Set();
+  return g.__acprouterSessionHistoryReplay;
+}
+
+/** Underlying session/load may replay history; the Router replays its own durable log once. */
+export function suppressSessionHistoryReplay(sessionId: string): () => void {
+  getHistoryReplays().add(sessionId);
+  return () => getHistoryReplays().delete(sessionId);
+}
+
+/** A load must observe all events emitted before it reads the durable history. */
+export async function flushSessionEvents(sessionId: string): Promise<void> {
+  const state = getPersistenceRegistry().get(sessionId);
+  await state?.pending;
+  if (state?.error) {
+    throw new ORPCError("INTERNAL_SERVER_ERROR", {
+      message: "Session history could not be persisted. Check Router storage before retrying.",
+    });
   }
-  return g.__acprouterSessionEventSeqs;
-}
-
-function nextSeq(sessionId: string): number {
-  const counters = getSeqCounters();
-  const seq = (counters.get(sessionId) ?? 0) + 1;
-  counters.set(sessionId, seq);
-  return seq;
-}
-
-/**
- * A Router process restart loses this counter along with every other piece
- * of this file's in-memory state — confirmed as NOT a new failure mode: the
- * whole in-memory session already dies with the process per task #11's
- * design (a restarted Router holds no live bridge connection to resume a
- * session on, and ACP v1 itself has no transport-level resume — spec §5.4 —
- * so there is no live agent process left that could ever emit another event
- * for this `sessionId` after a restart). A restart therefore cannot produce
- * a seq collision, because it cannot produce any MORE events for a session
- * it no longer has a connection to.
- */
-function clearSeq(sessionId: string): void {
-  getSeqCounters().delete(sessionId);
 }
 
 /**
  * Fire-and-forget, never awaited by any caller — the relay's synchronous
  * push to the browser's queue (this file's core contract; see
  * `createEventQueue`'s doc comment) must never wait on a DB round trip.
- * `seq` is assigned SYNCHRONOUSLY, in true emission order, before the async
- * write is kicked off, so ordering is correct even though the underlying
- * inserts' completion order is not guaranteed.
+ * Writes are queued in emission order. A fresh process seeds its counter
+ * from the durable maximum instead of colliding with an old session's log.
  */
 function persistEvent(
   dbPromise: Promise<Database>,
   sessionId: string,
   event: SessionStreamEvent,
 ): void {
-  const seq = nextSeq(sessionId);
-  void dbPromise
-    .then((db) => appendSessionEvent(db, sessionId, seq, toStreamEventVO(event)))
+  const registry = getPersistenceRegistry();
+  let state = registry.get(sessionId);
+  if (!state) {
+    state = { seq: null, pending: Promise.resolve() };
+    registry.set(sessionId, state);
+  }
+  const persistence = state;
+  const pending = persistence.pending
+    .then(async () => {
+      const db = await dbPromise;
+      persistence.seq ??= await getSessionEventMaxSeq(db, sessionId);
+      persistence.seq += 1;
+      await appendSessionEvent(db, sessionId, persistence.seq, toStreamEventVO(event));
+    })
     .catch((error: unknown) => {
+      persistence.error = error;
       console.error(
-        `[acprouter] failed to persist session event session=${sessionId} seq=${seq} type=${event.type}: ${String(error)}`,
+        `[acprouter] failed to persist session event session=${sessionId} type=${event.type}: ${String(error)}`,
       );
     });
+  persistence.pending = pending;
+  if (event.type === "session_ended") {
+    void pending.then(() => {
+      if (!persistence.error && registry.get(sessionId)?.pending === pending) {
+        registry.delete(sessionId);
+      }
+    });
+  }
 }
 
 /**
@@ -268,6 +283,7 @@ export function emitSessionUpdate(
   sessionId: string,
   update: acp.SessionUpdate,
 ): void {
+  if (getHistoryReplays().has(sessionId)) return;
   const event: SessionStreamEvent = { type: "session_update", update };
   getRegistry().get(sessionId)?.queue?.push(event);
   persistEvent(dbPromise, sessionId, event);
@@ -312,14 +328,6 @@ export function emitSessionTerminal(
         `[acprouter] failed to update session status session=${sessionId} type=${event.type}: ${String(error)}`,
       );
     });
-
-  if (event.type === "session_ended") {
-    // The session's event log is genuinely over — nothing will ever emit
-    // another event for this `sessionId` again (see `clearSeq`'s doc
-    // comment). `turn_ended` deliberately does NOT clear it: the session is
-    // still open for another prompt, which reuses this same counter.
-    clearSeq(sessionId);
-  }
 }
 
 export interface RequestSessionPermissionOptions {

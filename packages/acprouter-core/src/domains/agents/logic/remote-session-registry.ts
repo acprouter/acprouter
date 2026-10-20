@@ -1,4 +1,4 @@
-import type { ClientConnection } from "@agentclientprotocol/sdk";
+import type { ClientConnection, LoadSessionResponse } from "@agentclientprotocol/sdk";
 import type WebSocket from "ws";
 
 /**
@@ -24,6 +24,7 @@ export interface RemoteSessionConnection {
   readonly connection: ClientConnection;
   readonly socket: WebSocket;
   readonly connectedAt: Date;
+  readonly sessionResponse: LoadSessionResponse;
 }
 
 type GlobalWithRemoteSessions = typeof globalThis & {
@@ -43,8 +44,13 @@ export function registerRemoteSessionConnection(
   sessionId: string,
   connection: ClientConnection,
   socket: WebSocket,
+  sessionResponse: LoadSessionResponse = {},
 ): void {
-  getRegistry().set(sessionId, { connection, socket, connectedAt: new Date() });
+  const entry = { connection, socket, sessionResponse, connectedAt: new Date() };
+  getRegistry().set(sessionId, entry);
+  socket.once?.("close", () => {
+    if (getRegistry().get(sessionId) === entry) getRegistry().delete(sessionId);
+  });
 }
 
 export function getRemoteSessionConnection(sessionId: string): RemoteSessionConnection | undefined {

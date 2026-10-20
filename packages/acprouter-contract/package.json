@@ -1,7 +1,7 @@
 {
   "name": "@acprouter/contract",
   "description": "Client-safe ACP Router surface: oRPC contract + pure-zod DTO/VO schemas. No @orpc/server, no db/logic deps — consumed by the Router server and any consumer client.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": false,
   "license": "MIT",
   "publishConfig": {

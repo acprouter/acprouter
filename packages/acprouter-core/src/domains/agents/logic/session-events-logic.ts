@@ -34,6 +34,17 @@ export async function appendSessionEvent(
   });
 }
 
+/** Seeds the relay's counter when an existing session survives a Router restart. */
+export async function getSessionEventMaxSeq(db: Database, sessionId: string): Promise<number> {
+  const [row] = await db
+    .select({ seq: acprouterAgentSessionEvents.seq })
+    .from(acprouterAgentSessionEvents)
+    .where(eq(acprouterAgentSessionEvents.sessionId, sessionId))
+    .orderBy(desc(acprouterAgentSessionEvents.seq))
+    .limit(1);
+  return row?.seq ?? 0;
+}
+
 /**
  * Real persisted history, in emission order — the read-back half of task
  * #12 (step 3): a `logic/` function backing the `sessions.history` oRPC

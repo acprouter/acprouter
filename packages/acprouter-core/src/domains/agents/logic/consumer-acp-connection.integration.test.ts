@@ -335,7 +335,7 @@ describe("createConsumerAcpAgentApp / resolveConsumerAcpAuth", () => {
         protocolVersion: acp.PROTOCOL_VERSION,
         clientCapabilities: {},
       });
-      expect(initResult.agentCapabilities?.loadSession).toBe(false);
+      expect(initResult.agentCapabilities?.loadSession).toBe(true);
 
       const { sessionId } = await client.agent.request(acp.methods.agent.session.new, {
         cwd: "/",

@@ -1,7 +1,7 @@
 {
   "name": "@acprouter/cli",
   "description": "ACP Router local bridge — dials out to a Router and puts this machine's agents on the network.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": false,
   "license": "MIT",
   "publishConfig": {

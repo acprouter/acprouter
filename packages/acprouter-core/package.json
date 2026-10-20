@@ -1,7 +1,7 @@
 {
   "name": "@acprouter/core",
   "description": "ACP Router shared server logic: ACP client/agent layer, registry sync, machine/session state machines, oRPC router. Consumed by the Router server and any other deployment built on the same schema.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": false,
   "license": "MIT",
   "publishConfig": {

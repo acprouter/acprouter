@@ -213,10 +213,8 @@ describe("connectRemoteAcpAgent + remote-acp session flow (task #13)", () => {
       const result = await endAgentSession(db, { agentId: agent.id, sessionId });
       expect(result.ok).toBe(true);
 
-      // The per-session connection was closed by `endAgentSession` — a
-      // second prompt against the same (now-gone) sessionId must fail
-      // cleanly (a thrown/rejected PRECONDITION_FAILED from
-      // `resolveConnectionForExistingSession`), never hang.
+      // Explicitly ended sessions fail the durable ownership/status guard,
+      // even if a stale runtime connection were still present.
       await expect(async () => {
         for await (const _event of promptAgentSession(db, {
           agentId: agent.id,
@@ -226,7 +224,7 @@ describe("connectRemoteAcpAgent + remote-acp session flow (task #13)", () => {
           // no-op — should never yield, the generator should throw before
           // its first `next()` resolves.
         }
-      }).rejects.toThrow(/no live connection/i);
+      }).rejects.toThrow(/session is unavailable/i);
     });
   });
 });
