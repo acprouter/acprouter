@@ -39,8 +39,10 @@ import {
   DEFAULT_PERMISSION_TIMEOUT_MS,
   emitSessionTerminal,
   emitSessionUpdate,
+  flushSessionEvents,
   requestSessionPermission,
   stopWatchingSession,
+  suppressSessionHistoryReplay,
   toStreamEventVO,
   watchSession,
 } from "./session-relay-registry";
@@ -57,6 +59,50 @@ import { getSessionAgentId, markSessionActive, markSessionEnded } from "./sessio
 interface ResolvedAgentConnection {
   agent: AgentPO;
   connection: acp.ClientConnection;
+}
+
+type GlobalWithSessionOperations = typeof globalThis & {
+  __acprouterSessionOperations?: Map<string, "prompt" | "load">;
+};
+
+/** Loading must not suppress updates from an in-flight turn or replace its watcher. */
+function getSessionOperations(): Map<string, "prompt" | "load"> {
+  const g = globalThis as GlobalWithSessionOperations;
+  g.__acprouterSessionOperations ??= new Map();
+  return g.__acprouterSessionOperations;
+}
+
+function beginSessionOperation(sessionId: string, operation: "prompt" | "load"): () => void {
+  const operations = getSessionOperations();
+  if (operations.has(sessionId)) {
+    throw new ORPCError("PRECONDITION_FAILED", {
+      message: "This session is busy. Wait for its current turn or restore to finish and retry.",
+    });
+  }
+  operations.set(sessionId, operation);
+  return () => operations.delete(sessionId);
+}
+
+async function requireOwnedSession(
+  db: Database,
+  input: { agentId: string; sessionId: string },
+  allowEnded = false,
+): Promise<AgentPO> {
+  const agent = await getAgentById(db, input.agentId);
+  const [session] = await db
+    .select({ agentId: acprouterAgentSessions.agentId, status: acprouterAgentSessions.status })
+    .from(acprouterAgentSessions)
+    .where(eq(acprouterAgentSessions.id, input.sessionId))
+    .limit(1);
+  if (
+    !agent ||
+    !session ||
+    session.agentId !== agent.id ||
+    (!allowEnded && session.status === "ended")
+  ) {
+    throw new ORPCError("NOT_FOUND", { message: "Session is unavailable for this agent." });
+  }
+  return agent;
 }
 
 /**
@@ -90,7 +136,7 @@ async function resolveConnectionForNewSession(
   agentId: string,
 ): Promise<
   ResolvedAgentConnection & {
-    onSessionCreated: (sessionId: string) => void;
+    onSessionCreated: (response: acp.NewSessionResponse) => void;
     onSessionCreateFailed: (error: unknown) => void;
   }
 > {
@@ -104,8 +150,8 @@ async function resolveConnectionForNewSession(
     return {
       agent,
       connection,
-      onSessionCreated: (sessionId) =>
-        registerRemoteSessionConnection(sessionId, connection, socket),
+      onSessionCreated: (response) =>
+        registerRemoteSessionConnection(response.sessionId, connection, socket, response),
       onSessionCreateFailed: (error) => {
         connection.close(error);
         socket.close();
@@ -207,7 +253,11 @@ async function resolveConnectionForExistingSession(
 async function dialRemoteAcpConnectionForSession(
   db: Database,
   agent: AgentPO,
-): Promise<{ connection: acp.ClientConnection; socket: WebSocket }> {
+): Promise<{
+  connection: acp.ClientConnection;
+  socket: WebSocket;
+  initializeResult: acp.InitializeResponse;
+}> {
   if (!agent.endpoint || !agent.credentialId) {
     throw new ORPCError("PRECONDITION_FAILED", {
       message: `"${agent.label}" has no endpoint/credential on record — cannot start a session.`,
@@ -250,8 +300,8 @@ async function dialRemoteAcpConnectionForSession(
     )
     .connect(streamFromWebSocket(socket));
 
-  await performAcpInitializeHandshake(connection, socket, agent.endpoint);
-  return { connection, socket };
+  const initializeResult = await performAcpInitializeHandshake(connection, socket, agent.endpoint);
+  return { connection, socket, initializeResult };
 }
 
 /**
@@ -283,7 +333,7 @@ async function dialRemoteAcpConnectionForSession(
 export async function startAgentSession(
   db: Database,
   agentId: string,
-): Promise<{ sessionId: string }> {
+): Promise<acp.NewSessionResponse> {
   const resolved = await resolveConnectionForNewSession(db, agentId);
   const { agent, connection } = resolved;
 
@@ -298,7 +348,7 @@ export async function startAgentSession(
     resolved.onSessionCreateFailed(error);
     throw error;
   }
-  resolved.onSessionCreated(response.sessionId);
+  resolved.onSessionCreated(response);
 
   // Registered BEFORE the lock+insert transaction below, not after: if
   // `removeAgent` wins the race (see that transaction's comment) and ends
@@ -378,7 +428,112 @@ export async function startAgentSession(
     console.error(`[acprouter] retention sweep failed: ${String(error)}`);
   });
 
-  return { sessionId: response.sessionId };
+  return response;
+}
+
+/** Attach the existing runtime; history is replayed separately by the consumer ACP handler. */
+export async function loadAgentSession(
+  db: Database,
+  input: { agentId: string; sessionId: string },
+  replay?: () => Promise<void>,
+): Promise<acp.LoadSessionResponse> {
+  const agent = await requireOwnedSession(db, input);
+  const finish = beginSessionOperation(input.sessionId, "load");
+  async function complete(
+    response: acp.LoadSessionResponse,
+    connection: acp.ClientConnection,
+  ): Promise<acp.LoadSessionResponse> {
+    async function checkStillUsable(): Promise<void> {
+      try {
+        await requireOwnedSession(db, input);
+      } catch (error) {
+        // A cancel/removal can win while the actual session/load is awaiting
+        // a spawned process. Cancel again now that the restored runtime exists.
+        await connection.agent
+          .notify(acp.methods.agent.session.cancel, { sessionId: input.sessionId })
+          .catch(() => undefined);
+        if (agent.kind === "remote-acp") closeRemoteSessionConnection(input.sessionId);
+        throw error;
+      }
+    }
+    await checkStillUsable();
+    await replay?.();
+    await checkStillUsable();
+    return response;
+  }
+  try {
+    await flushSessionEvents(input.sessionId);
+    if (agent.kind === "remote-acp") {
+      const existing = getRemoteSessionConnection(input.sessionId);
+      if (existing && existing.socket.readyState === 1) {
+        return await complete(existing.sessionResponse, existing.connection);
+      }
+      if (existing) closeRemoteSessionConnection(input.sessionId);
+
+      const { connection, socket, initializeResult } = await dialRemoteAcpConnectionForSession(
+        db,
+        agent,
+      );
+      const stopSuppression = suppressSessionHistoryReplay(input.sessionId);
+      let response: acp.LoadSessionResponse;
+      try {
+        if (initializeResult.agentCapabilities?.loadSession !== true) {
+          throw new ORPCError("NOT_IMPLEMENTED", {
+            message: "This remote agent does not support reopening an existing ACP session.",
+          });
+        }
+        response = await connection.agent.request(acp.methods.agent.session.load, {
+          sessionId: input.sessionId,
+          cwd: agent.cwd ?? "/",
+          mcpServers: [],
+        });
+        registerRemoteSessionConnection(input.sessionId, connection, socket, response);
+        rememberSessionCapabilities(
+          input.sessionId,
+          initializeResult.agentCapabilities?.promptCapabilities ?? null,
+        );
+      } catch (error) {
+        connection.close(error);
+        socket.close();
+        throw error;
+      } finally {
+        stopSuppression();
+      }
+      return await complete(response, connection);
+    }
+
+    const { connection } = await resolveConnectionForExistingSession(
+      db,
+      input.agentId,
+      input.sessionId,
+    );
+    const stopSuppression = suppressSessionHistoryReplay(input.sessionId);
+    try {
+      const response = await connection.agent.request(acp.methods.agent.session.load, {
+        sessionId: input.sessionId,
+        cwd: agent.cwd ?? "/",
+        mcpServers: [],
+        _meta: { registrySlug: agent.registrySlug },
+      });
+      rememberSessionCapabilities(
+        input.sessionId,
+        parseBridgeSessionMeta(response._meta)?.promptCapabilities ?? null,
+      );
+      return await complete(response, connection);
+    } catch (error) {
+      if (error instanceof acp.RequestError && error.code === -32601) {
+        throw new ORPCError("NOT_IMPLEMENTED", {
+          message:
+            "This machine's ACPRouter bridge cannot reopen sessions. Update the CLI and reconnect it.",
+        });
+      }
+      throw error;
+    } finally {
+      stopSuppression();
+    }
+  } finally {
+    finish();
+  }
 }
 
 /**
@@ -418,6 +573,7 @@ export async function* promptAgentSession(
     attachments?: PromptAttachmentInput[];
   },
 ): AsyncGenerator<AgentSessionStreamEventVO, void, void> {
+  await requireOwnedSession(db, input);
   const { agent, connection } = await resolveConnectionForExistingSession(
     db,
     input.agentId,
@@ -442,6 +598,13 @@ export async function* promptAgentSession(
     (agent.capabilities?.promptCapabilities as acp.PromptCapabilities | undefined) ??
     null;
   const { prompt, notes } = buildPromptContent(input.text, input.attachments, promptCapabilities);
+  const finish = beginSessionOperation(input.sessionId, "prompt");
+  try {
+    await requireOwnedSession(db, input);
+  } catch (error) {
+    finish();
+    throw error;
+  }
 
   // Best-effort, fire-and-forget (task #12): re-arms `"active"` for a
   // session that read `"idle"` after a previous turn. Never awaited — must
@@ -475,7 +638,8 @@ export async function* promptAgentSession(
         type: "session_ended",
         reason: `The prompt failed: ${error instanceof Error ? error.message : String(error)}`,
       });
-    });
+    })
+    .finally(finish);
 
   // After the request is in flight, so the `watchSession` → prompt-request
   // pairing above stays in one synchronous tick (a `yield` suspends this
@@ -495,6 +659,9 @@ export async function* promptAgentSession(
     // `return()`, e.g. the tab closed) — either way, nothing should still be
     // routing session/update chunks to a consumer that's gone.
     stopWatchingSession(input.sessionId);
+    // Live chunks remain nonblocking; completion is the durable boundary
+    // that a subsequent session/load (and a drained stream) can rely on.
+    await flushSessionEvents(input.sessionId);
   }
 }
 
@@ -556,6 +723,10 @@ export async function endAgentSession(
   input: { agentId: string; sessionId: string },
 ): Promise<{ ok: boolean }> {
   try {
+    await requireOwnedSession(db, input, true);
+    // Persist cancellation before waiting for transport. A load already in
+    // flight must see it even when no runtime exists to receive cancel yet.
+    await markSessionEnded(db, input.sessionId);
     const { agent, connection } = await resolveConnectionForExistingSession(
       db,
       input.agentId,
@@ -570,11 +741,6 @@ export async function endAgentSession(
     // The process those capabilities described is gone; a long-lived Router
     // must not accumulate one entry per session it ever ran.
     forgetSessionCapabilities(input.sessionId);
-    void markSessionEnded(db, input.sessionId).catch((error: unknown) => {
-      console.error(
-        `[acprouter] failed to mark session ended sessionId=${input.sessionId}: ${String(error)}`,
-      );
-    });
     return { ok: true };
   } catch {
     return { ok: false };

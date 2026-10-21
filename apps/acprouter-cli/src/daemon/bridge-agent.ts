@@ -4,7 +4,7 @@ import * as acp from "@agentclientprotocol/sdk";
 import type { AuthStatus } from "../config";
 import { detectAgent } from "../detect";
 import { resolveAgentDistribution, type SpawnSpec } from "./agent-distribution";
-import { spawnAndInitializeAgent } from "./agent-spawn";
+import { type SpawnedAgent, spawnAndInitializeAgent } from "./agent-spawn";
 
 /**
  * One live `session/new` → spawned-process turn (spec §5.4: "one agent
@@ -16,6 +16,8 @@ interface BridgeSession {
   registrySlug: string;
   child: ChildProcessWithoutNullStreams;
   inner: acp.ClientConnection;
+  response: acp.LoadSessionResponse;
+  activePrompt: symbol | null;
 }
 
 export interface BridgeAgentDeps {
@@ -59,7 +61,7 @@ export interface BridgeAgentHandle {
  * resolves against the pinned registry below, and any other value fails
  * closed via `resolveAgentDistribution` returning `null`.
  */
-function readRegistrySlug(params: acp.NewSessionRequest): string | null {
+function readRegistrySlug(params: acp.NewSessionRequest | acp.LoadSessionRequest): string | null {
   const meta = params._meta;
   if (!meta || typeof meta !== "object") return null;
   const value = (meta as Record<string, unknown>).registrySlug;
@@ -93,11 +95,182 @@ function readRegistrySlug(params: acp.NewSessionRequest): string | null {
  */
 export function createBridgeAgentApp(deps: BridgeAgentDeps): BridgeAgentHandle {
   const sessions = new Map<acp.SessionId, BridgeSession>();
+  const loading = new Map<acp.SessionId, Promise<BridgeSession>>();
   const log = deps.log ?? (() => {});
   const resolveDistribution = deps.resolveDistribution ?? resolveAgentDistribution;
+  let routerConnection: acp.AgentConnection | null = null;
+  let disposed = false;
+  let reportedDisconnected = false;
+  const pendingUpdates = new Map<acp.SessionId, Set<Promise<void>>>();
+
+  function routerClient(): acp.AgentContext {
+    if (!routerConnection || routerConnection.signal.aborted) {
+      throw acp.RequestError.internalError(null, "Router connection is unavailable");
+    }
+    return routerConnection.client;
+  }
+
+  function reportDroppedUpdate(error: unknown): void {
+    if (reportedDisconnected) return;
+    reportedDisconnected = true;
+    log(`dropping session updates until the Router reconnects: ${String(error)}`);
+  }
+
+  function resolveSessionSlug(
+    params: acp.NewSessionRequest | acp.LoadSessionRequest,
+    liveSlug?: string,
+  ): string {
+    const requestedSlug = readRegistrySlug(params);
+    if (params._meta?.registrySlug !== undefined && !requestedSlug) {
+      throw acp.RequestError.invalidParams(null, "invalid _meta.registrySlug");
+    }
+    if (deps.registrySlug && requestedSlug && deps.registrySlug !== requestedSlug) {
+      throw acp.RequestError.invalidParams(
+        null,
+        "registrySlug does not match this bridge's configured agent",
+      );
+    }
+    const slug = deps.registrySlug || requestedSlug || liveSlug;
+    if (!slug) {
+      throw acp.RequestError.invalidParams(
+        null,
+        "session/new and session/load require a configured agent or _meta.registrySlug",
+      );
+    }
+    return slug;
+  }
+
+  function closeSession(session: Pick<BridgeSession, "child" | "inner">): void {
+    session.inner.close(new Error("bridge session closed"));
+    if (session.child.exitCode === null && !session.child.killed) session.child.kill();
+  }
+
+  async function spawnSession(registrySlug: string): Promise<SpawnedAgent> {
+    const spawned = await spawnAndInitializeAgent({
+      registrySlug,
+      dir: deps.dir,
+      log,
+      resolveDistribution,
+      onSessionUpdate: (innerCtx) => {
+        const session = sessions.get(innerCtx.params.sessionId);
+        const update = innerCtx.params.update;
+        if (session && update.sessionUpdate === "config_option_update") {
+          session.response.configOptions = update.configOptions;
+        } else if (session?.response.modes && update.sessionUpdate === "current_mode_update") {
+          session.response.modes = {
+            ...session.response.modes,
+            currentModeId: update.currentModeId,
+          };
+        }
+        // Resolve the current connection for every delivery. No queue or retry:
+        // delivery across a lost connection has an uncertain outcome.
+        try {
+          const client = routerClient();
+          const pending = pendingUpdates.get(innerCtx.params.sessionId) ?? new Set<Promise<void>>();
+          pendingUpdates.set(innerCtx.params.sessionId, pending);
+          const delivery = client
+            .notify(acp.methods.client.session.update, innerCtx.params)
+            .catch(reportDroppedUpdate);
+          pending.add(delivery);
+          void delivery.finally(() => {
+            pending.delete(delivery);
+            if (pending.size === 0) pendingUpdates.delete(innerCtx.params.sessionId);
+          });
+        } catch (error) {
+          reportDroppedUpdate(error);
+        }
+      },
+      onRequestPermission: (innerCtx) =>
+        routerClient().request(acp.methods.client.session.requestPermission, innerCtx.params),
+    });
+    if (disposed) {
+      closeSession(spawned);
+      throw acp.RequestError.internalError(null, "bridge is shutting down");
+    }
+    return spawned;
+  }
+
+  function rememberSession(
+    sessionId: acp.SessionId,
+    spawned: SpawnedAgent,
+    response: acp.LoadSessionResponse,
+  ): BridgeSession {
+    if (disposed || spawned.inner.signal.aborted || spawned.child.exitCode !== null) {
+      closeSession(spawned);
+      throw acp.RequestError.internalError(null, "spawned agent session is no longer available");
+    }
+    if (sessions.has(sessionId)) {
+      closeSession(spawned);
+      throw acp.RequestError.invalidParams({ sessionId }, "bridge session already exists");
+    }
+    const session: BridgeSession = {
+      registrySlug: spawned.registrySlug,
+      child: spawned.child,
+      inner: spawned.inner,
+      response: {
+        ...response,
+        _meta: {
+          ...(response._meta ?? {}),
+          promptCapabilities: spawned.initializeResult.agentCapabilities?.promptCapabilities ?? {},
+        } satisfies BridgeSessionMeta & Record<string, unknown>,
+      },
+      activePrompt: null,
+    };
+    sessions.set(sessionId, session);
+    const forget = () => {
+      // A late close from a replaced child must not remove its replacement.
+      if (sessions.get(sessionId) === session) sessions.delete(sessionId);
+    };
+    spawned.child.once("exit", (code, signal) => {
+      log(
+        `${spawned.registrySlug} subprocess exited (code=${code ?? "null"} signal=${signal ?? "null"})`,
+      );
+      forget();
+    });
+    spawned.inner.closed
+      .catch(() => undefined)
+      .finally(() => {
+        forget();
+        closeSession(session);
+      });
+    return session;
+  }
+
+  async function restoreSession(params: acp.LoadSessionRequest): Promise<BridgeSession> {
+    const registrySlug = resolveSessionSlug(params);
+    const spawned = await spawnSession(registrySlug);
+    try {
+      if (!spawned.initializeResult.agentCapabilities?.loadSession) {
+        throw acp.RequestError.invalidParams(
+          { sessionId: params.sessionId, registrySlug },
+          "configured agent does not support loading an existing ACP session",
+        );
+      }
+      const response = await spawned.inner.agent.request(acp.methods.agent.session.load, {
+        sessionId: params.sessionId,
+        cwd: deps.dir,
+        additionalDirectories: [],
+        mcpServers: [],
+      });
+      await Promise.all(pendingUpdates.get(params.sessionId) ?? []);
+      return rememberSession(params.sessionId, spawned, response);
+    } catch (error) {
+      closeSession(spawned);
+      throw error;
+    }
+  }
 
   const app = acp
     .agent({ name: "acprouter-cli" })
+    .onConnect((connection) => {
+      routerConnection = connection;
+      reportedDisconnected = false;
+      connection.closed
+        .catch(() => undefined)
+        .finally(() => {
+          if (routerConnection === connection) routerConnection = null;
+        });
+    })
     .onRequest(acp.methods.agent.initialize, () => {
       // Reports task #10's new facts on the SAME handshake the Router
       // already performs, rather than a second connection or a poll
@@ -118,40 +291,14 @@ export function createBridgeAgentApp(deps: BridgeAgentDeps): BridgeAgentHandle {
       };
       return {
         protocolVersion: acp.PROTOCOL_VERSION,
-        agentCapabilities: { loadSession: false },
+        agentCapabilities: { loadSession: true },
         authMethods: [],
         _meta: meta,
       };
     })
     .onRequest(acp.methods.agent.session.new, async (ctx) => {
-      const registrySlug = readRegistrySlug(ctx.params);
-      if (!registrySlug) {
-        throw acp.RequestError.invalidParams(
-          { reason: "missing__meta.registrySlug" },
-          "session/new requires _meta.registrySlug identifying which pinned agent to spawn",
-        );
-      }
-
-      // Captured once here, per-session — connection-scoped (see
-      // `AgentHandlerContext.client`'s doc comment), so the inner
-      // connection's handlers below can keep using it for the rest of the
-      // session's life without threading it through every call.
-      const outerClient = ctx.client;
-      const spawned = await spawnAndInitializeAgent({
-        registrySlug,
-        dir: deps.dir,
-        log: (line) => log(`session/new: ${line}`),
-        resolveDistribution,
-        onSessionUpdate: (innerCtx) => {
-          void outerClient
-            .notify(acp.methods.client.session.update, innerCtx.params)
-            .catch((error) => {
-              log(`failed to relay session/update to Router: ${String(error)}`);
-            });
-        },
-        onRequestPermission: (innerCtx) =>
-          outerClient.request(acp.methods.client.session.requestPermission, innerCtx.params),
-      });
+      const registrySlug = resolveSessionSlug(ctx.params);
+      const spawned = await spawnSession(registrySlug);
       const { child, inner } = spawned;
 
       let newSession: acp.NewSessionResponse;
@@ -162,8 +309,7 @@ export function createBridgeAgentApp(deps: BridgeAgentDeps): BridgeAgentHandle {
           mcpServers: [],
         });
       } catch (error) {
-        child.kill();
-        inner.close(error);
+        closeSession({ child, inner });
         if (error instanceof acp.RequestError) throw error;
         throw acp.RequestError.internalError(
           { registrySlug },
@@ -171,21 +317,8 @@ export function createBridgeAgentApp(deps: BridgeAgentDeps): BridgeAgentHandle {
         );
       }
 
-      const sessionId = newSession.sessionId;
-      sessions.set(sessionId, { registrySlug, child, inner });
-
-      child.once("exit", (code, signal) => {
-        log(
-          `${registrySlug} subprocess exited (code=${code ?? "null"} signal=${signal ?? "null"})`,
-        );
-        sessions.delete(sessionId);
-      });
-      inner.closed
-        .catch(() => undefined)
-        .finally(() => {
-          sessions.delete(sessionId);
-          if (child.exitCode === null && !child.killed) child.kill();
-        });
+      const { sessionId, ...response } = newSession;
+      const session = rememberSession(sessionId, spawned, response);
 
       // Forwarded in full, not just `{ sessionId }` — `modes`/`configOptions`/
       // `_meta` are the spawned agent's real negotiated capabilities (spec
@@ -201,12 +334,53 @@ export function createBridgeAgentApp(deps: BridgeAgentDeps): BridgeAgentHandle {
       // Spread so an agent's own `session/new` `_meta` is preserved, not
       // replaced.
       return {
-        ...newSession,
-        _meta: {
-          ...(newSession._meta ?? {}),
-          promptCapabilities: spawned.initializeResult.agentCapabilities?.promptCapabilities ?? {},
-        } satisfies BridgeSessionMeta & Record<string, unknown>,
+        sessionId,
+        ...session.response,
       };
+    })
+    .onRequest(acp.methods.agent.session.load, async (ctx) => {
+      const sessionId = ctx.params.sessionId;
+      let session = sessions.get(sessionId);
+      if (session && (session.inner.signal.aborted || session.child.exitCode !== null)) {
+        sessions.delete(sessionId);
+        closeSession(session);
+        session = undefined;
+      }
+      if (session) {
+        const registrySlug = resolveSessionSlug(ctx.params, session.registrySlug);
+        if (registrySlug !== session.registrySlug) {
+          throw acp.RequestError.invalidParams(
+            null,
+            "registrySlug does not match the existing session",
+          );
+        }
+        if (session.activePrompt) {
+          throw acp.RequestError.invalidParams(
+            { sessionId, reason: "session_busy" },
+            "bridge session still has an active prompt; wait for it to finish before loading",
+          );
+        }
+        // The live process already owns the conversation; loading it again
+        // could reset or duplicate work. Only a missing process needs load.
+        return session.response;
+      }
+      let pending = loading.get(sessionId);
+      if (!pending) {
+        pending = restoreSession(ctx.params);
+        loading.set(sessionId, pending);
+      }
+      try {
+        session = await pending;
+        if (resolveSessionSlug(ctx.params) !== session.registrySlug) {
+          throw acp.RequestError.invalidParams(
+            null,
+            "registrySlug does not match the existing session",
+          );
+        }
+        return session.response;
+      } finally {
+        if (loading.get(sessionId) === pending) loading.delete(sessionId);
+      }
     })
     .onRequest(acp.methods.agent.session.prompt, async (ctx) => {
       const session = sessions.get(ctx.params.sessionId);
@@ -216,8 +390,28 @@ export function createBridgeAgentApp(deps: BridgeAgentDeps): BridgeAgentHandle {
           `no active bridge session for ${ctx.params.sessionId}`,
         );
       }
-      // Same session id on both hops (1:1 mapping) — forward as-is.
-      return session.inner.agent.request(acp.methods.agent.session.prompt, ctx.params);
+      if (session.activePrompt) {
+        throw acp.RequestError.invalidParams(
+          { sessionId: ctx.params.sessionId, reason: "session_busy" },
+          "bridge session still has an active prompt",
+        );
+      }
+      const promptToken = Symbol("active prompt");
+      session.activePrompt = promptToken;
+      // Flush updates already emitted by the child before the terminal
+      // response closes the Router's event stream. Never retry the prompt.
+      try {
+        const result = await session.inner.agent.request(
+          acp.methods.agent.session.prompt,
+          ctx.params,
+        );
+        await Promise.all(pendingUpdates.get(ctx.params.sessionId) ?? []);
+        return result;
+      } finally {
+        // The child, rather than the outer socket, owns this lock. Closing
+        // an outer request cannot permit another turn while it still runs.
+        if (session.activePrompt === promptToken) session.activePrompt = null;
+      }
     })
     .onNotification(acp.methods.agent.session.cancel, (ctx) => {
       const session = sessions.get(ctx.params.sessionId);
@@ -230,14 +424,10 @@ export function createBridgeAgentApp(deps: BridgeAgentDeps): BridgeAgentHandle {
     });
 
   async function disposeAllSessions(): Promise<void> {
+    disposed = true;
     const live = [...sessions.values()];
     sessions.clear();
-    await Promise.all(
-      live.map(async ({ child, inner }) => {
-        inner.close(new Error("bridge shutting down"));
-        if (child.exitCode === null && !child.killed) child.kill();
-      }),
-    );
+    await Promise.all(live.map(async (session) => closeSession(session)));
   }
 
   return { app, disposeAllSessions };

@@ -43,14 +43,21 @@
 
 import type { AgentSessionStreamEventVO } from "@acprouter/contract";
 import * as acp from "@agentclientprotocol/sdk";
+import { ORPCError } from "@orpc/server";
 import { eq } from "drizzle-orm";
 import { runWithMemberContext } from "../../../context";
 import type { Database } from "../../../db";
 import { acprouterAgents } from "../schema/agents";
 import { resolveConsumerApiKeyId } from "./consumer-api-keys-logic";
-import { resolveSessionPermission } from "./session-relay-registry";
+import { listSessionEvents } from "./session-events-logic";
+import { flushSessionEvents, resolveSessionPermission } from "./session-relay-registry";
 import { getSessionAgentId } from "./session-status-logic";
-import { endAgentSession, promptAgentSession, startAgentSession } from "./sessions-logic";
+import {
+  endAgentSession,
+  loadAgentSession,
+  promptAgentSession,
+  startAgentSession,
+} from "./sessions-logic";
 
 export interface ConsumerAcpIdentity {
   agentId: string;
@@ -180,7 +187,14 @@ export function createConsumerAcpAgentApp(
   ): Promise<T> {
     const identity = await requireIdentity();
     const db = await dbPromise;
-    return runWithMemberContext({ db, ownerId: identity.ownerId }, () => fn(db, identity));
+    try {
+      return await runWithMemberContext({ db, ownerId: identity.ownerId }, () => fn(db, identity));
+    } catch (error) {
+      // The ACP SDK masks ordinary errors as "Internal error". Our logic's
+      // explicit public failures need actionable messages on this transport too.
+      if (error instanceof ORPCError) throw new acp.RequestError(-32000, error.message);
+      throw error;
+    }
   }
 
   async function requireSession(
@@ -197,15 +211,12 @@ export function createConsumerAcpAgentApp(
     .agent({ name: "acprouter" })
     .onRequest(acp.methods.agent.initialize, async () => {
       await requireIdentity();
-      // Honest capabilities only — this Router has no `session/load` path
-      // for an external consumer (only the dashboard's `sessions.history`
-      // read-back exists, a distinct oRPC procedure, not ACP's
-      // `session/load`), and no image/audio/embedded-context handling
-      // anywhere in `contentBlocksToPromptText` above.
+      // Session restoration is implemented below. Prompt capabilities remain
+      // restricted to the content this consumer adapter actually forwards.
       return {
         protocolVersion: acp.PROTOCOL_VERSION,
         agentCapabilities: {
-          loadSession: false,
+          loadSession: true,
           promptCapabilities: { image: false, audio: false, embeddedContext: false },
         },
       };
@@ -214,6 +225,30 @@ export function createConsumerAcpAgentApp(
       withIdentity(async (db, identity) => {
         const { sessionId } = await startAgentSession(db, identity.agentId);
         return { sessionId };
+      }),
+    )
+    .onRequest(acp.methods.agent.session.load, (ctx) =>
+      withIdentity(async (db, identity) => {
+        await loadAgentSession(
+          db,
+          {
+            agentId: identity.agentId,
+            sessionId: ctx.params.sessionId,
+          },
+          async () => {
+            await flushSessionEvents(ctx.params.sessionId);
+            for (const event of await listSessionEvents(db, ctx.params.sessionId)) {
+              if (event.type !== "session_update") continue;
+              await ctx.client.notify(acp.methods.client.session.update, {
+                sessionId: ctx.params.sessionId,
+                update: event.update,
+              });
+            }
+          },
+        );
+        // This adapter does not implement mode/config setters. Exposing their
+        // descriptors would make clients render controls that cannot work.
+        return {};
       }),
     )
     .onRequest(acp.methods.agent.session.prompt, (ctx) =>

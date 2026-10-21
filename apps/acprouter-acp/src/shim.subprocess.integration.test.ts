@@ -134,7 +134,7 @@ describe("@acprouter/acp shim — real built binary, real subprocess, real relay
       protocolVersion: acp.PROTOCOL_VERSION,
       clientCapabilities: {},
     });
-    expect(init.agentCapabilities?.loadSession).toBe(false);
+    expect(init.agentCapabilities?.loadSession).toBe(true);
 
     const { sessionId } = await client.agent.request(acp.methods.agent.session.new, {
       cwd: "/",
@@ -165,6 +165,88 @@ describe("@acprouter/acp shim — real built binary, real subprocess, real relay
         },
       },
     ]);
+
+    client.close();
+    shimChild.kill();
+    router.close();
+  }, 20_000);
+
+  it("relays session/load parameters and history updates without requiring session/new", async () => {
+    const router = await startFakeRouter();
+    const shimChild = spawnShim(["--agent", AGENT_ID, "--server", router.url], {
+      ACPROUTER_API_KEY: API_KEY,
+    });
+    const receivedUpdates: acp.SessionNotification[] = [];
+    const client = acp
+      .client({ name: "returning-editor" })
+      .onNotification(acp.methods.client.session.update, (ctx) => {
+        receivedUpdates.push(ctx.params);
+      })
+      .connect(streamFromShimChild(shimChild));
+
+    const init = await client.agent.request(acp.methods.agent.initialize, {
+      protocolVersion: acp.PROTOCOL_VERSION,
+      clientCapabilities: {},
+    });
+    expect(init.agentCapabilities?.loadSession).toBe(true);
+
+    const params: acp.LoadSessionRequest = {
+      sessionId: "sess_fake_router_saved",
+      cwd: "/projects/editor-workspace",
+      mcpServers: [{ name: "docs", command: "node", args: ["docs-server.mjs"], env: [] }],
+      _meta: { editor: "returning-editor", historyCursor: "cursor-17" },
+    };
+    const result = await client.agent.request(acp.methods.agent.session.load, params);
+
+    expect(result._meta?.receivedParams).toEqual(params);
+    expect(result.modes).toEqual({
+      currentModeId: "default",
+      availableModes: [{ id: "default", name: "Default" }],
+    });
+    expect(receivedUpdates).toEqual([
+      {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "user_message_chunk",
+          content: { type: "text", text: "saved question" },
+        },
+      },
+      {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "saved answer" },
+        },
+      },
+    ]);
+
+    client.close();
+    shimChild.kill();
+    router.close();
+  }, 20_000);
+
+  it("preserves an actionable Router rejection when session/load cannot restore a session", async () => {
+    const router = await startFakeRouter();
+    const shimChild = spawnShim(["--agent", AGENT_ID, "--server", router.url], {
+      ACPROUTER_API_KEY: API_KEY,
+    });
+    const client = acp.client({ name: "returning-editor" }).connect(streamFromShimChild(shimChild));
+
+    await client.agent.request(acp.methods.agent.initialize, {
+      protocolVersion: acp.PROTOCOL_VERSION,
+      clientCapabilities: {},
+    });
+    await expect(
+      client.agent.request(acp.methods.agent.session.load, {
+        sessionId: "sess_router_rejected",
+        cwd: "/projects/editor-workspace",
+        mcpServers: [],
+      }),
+    ).rejects.toMatchObject({
+      code: -32000,
+      message: "Session cannot be restored by this bridge; upgrade @acprouter/cli and reconnect.",
+      data: { sessionId: "sess_router_rejected", action: "upgrade-cli" },
+    });
 
     client.close();
     shimChild.kill();

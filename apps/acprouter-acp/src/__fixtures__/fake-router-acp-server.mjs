@@ -76,7 +76,7 @@ wss.on("connection", (socket, req) => {
         id: message.id,
         result: {
           protocolVersion: 1,
-          agentCapabilities: { loadSession: false },
+          agentCapabilities: { loadSession: true },
         },
       });
       return;
@@ -84,6 +84,44 @@ wss.on("connection", (socket, req) => {
 
     if (message.method === "session/new") {
       send({ jsonrpc: "2.0", id: message.id, result: { sessionId: "sess_fake_router_1" } });
+      return;
+    }
+
+    if (message.method === "session/load") {
+      const { sessionId } = message.params;
+      if (sessionId === "sess_router_rejected") {
+        send({
+          jsonrpc: "2.0",
+          id: message.id,
+          error: {
+            code: -32000,
+            message:
+              "Session cannot be restored by this bridge; upgrade @acprouter/cli and reconnect.",
+            data: { sessionId, action: "upgrade-cli" },
+          },
+        });
+        return;
+      }
+      for (const [sessionUpdate, text] of [
+        ["user_message_chunk", "saved question"],
+        ["agent_message_chunk", "saved answer"],
+      ]) {
+        notifyClient("session/update", {
+          sessionId,
+          update: { sessionUpdate, content: { type: "text", text } },
+        });
+      }
+      send({
+        jsonrpc: "2.0",
+        id: message.id,
+        result: {
+          modes: {
+            currentModeId: "default",
+            availableModes: [{ id: "default", name: "Default" }],
+          },
+          _meta: { receivedParams: message.params },
+        },
+      });
       return;
     }
 

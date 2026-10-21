@@ -148,6 +148,14 @@ export function createAcpShimApp(deps: CreateAcpShimAppDeps): AcpShimHandle {
         throw toShimRequestError(error, "session/new");
       }
     })
+    .onRequest(acp.methods.agent.session.load, async (ctx) => {
+      outerClient = ctx.client;
+      try {
+        return await routerConnection.agent.request(acp.methods.agent.session.load, ctx.params);
+      } catch (error) {
+        throw toShimRequestError(error, "session/load");
+      }
+    })
     .onRequest(acp.methods.agent.session.prompt, async (ctx) => {
       // Deliberately no timeout here (unlike `initialize` above): by the
       // time a `session/prompt` arrives, `initialize` already proved the
